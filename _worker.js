@@ -2,6 +2,7 @@ import { connect } from 'cloudflare:sockets';
 
 const TOKEN = 'xxx';
 const encoder = new TextEncoder();
+const PROXY_IP = '[2a00:1098:2b::1:6815:5881]';
 
 export default {
     async fetch(request) {
@@ -146,7 +147,7 @@ async function handleSession(webSocket) {
                     const parts = data.split('|');
                     const targetAddr = parts[0].substring(8); // 去掉 "CONNECT:"
                     const firstFrameData = parts[1] || '';
-                    const proxyIP = parts[2] || ''; // 第三个部分是可选的代理 IP
+                    const proxyIP = parts[2] || PROXY_IP; // 第三个部分是可选的代理 IP
                     
                     await connectToRemote(targetAddr, firstFrameData, proxyIP);
                 }
