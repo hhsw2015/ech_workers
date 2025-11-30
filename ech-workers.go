@@ -44,6 +44,7 @@ func init() {
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
+	flag.StringVar(&proxyIP, "pyip", "", "代理服务器 IP（用于 Worker 连接回退）")
 }
 
 func main() {
@@ -428,6 +429,10 @@ func runProxyServer(addr string) {
 	log.Printf("[代理] 后端服务器: %s", serverAddr)
 	if serverIP != "" {
 		log.Printf("[代理] 使用固定 IP: %s", serverIP)
+	}
+
+	if proxyIP != "" {
+		log.Printf("[代理] 回退代理 IP: %s", proxyIP)
 	}
 
 	for {
@@ -909,8 +914,12 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 		}
 	}
 
-	// 发送连接请求
+	// 构建连接消息，包含代理 IP 信息
 	connectMsg := fmt.Sprintf("CONNECT:%s|%s", target, firstFrame)
+	if proxyIP != "" {
+		connectMsg = fmt.Sprintf("CONNECT:%s|%s|%s", target, firstFrame, proxyIP)
+	}
+	
 	mu.Lock()
 	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
 	mu.Unlock()
