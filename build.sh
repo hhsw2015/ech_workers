@@ -243,12 +243,130 @@ BuildReleaseFreeBSD() {
   done
 }
 
+
+# 编译单个平台
+build_single() {
+    local platform=$1
+    local goos=$(echo "$platform" | cut -d'/' -f1)
+    local goarch_full=$(echo "$platform" | cut -d'/' -f2)
+    
+    # 解析架构和变体
+    local goarch="$goarch_full"
+    local goarm=""
+    local gomips=""
+    local arch_suffix="$goarch_full"
+    
+    # 处理ARM变体
+    if [[ "$goarch_full" =~ ^armv([5-8])$ ]]; then
+        goarch="arm"
+        goarm="${BASH_REMATCH[1]}"
+        arch_suffix="armv${goarm}"
+    # 处理MIPS变体
+    elif [[ "$goarch_full" =~ ^mips(le)?-(hard|soft)$ ]]; then
+        if [[ "$goarch_full" == *"le"* ]]; then
+            goarch="mipsle"
+        else
+            goarch="mips"
+        fi
+        # 转换MIPS变体名称为Go编译器认可的格式
+        if [[ "${BASH_REMATCH[2]}" == "hard" ]]; then
+            gomips="hardfloat"
+        else
+            gomips="softfloat"
+        fi
+        arch_suffix="$goarch_full"
+    fi
+    
+    echo -e "正在编译 ${platform}..."
+    
+    # 设置输出文件名
+    local output_name="${appName}-${goos}-${arch_suffix}"
+    if [[ "$goos" == "windows" ]]; then
+        output_name="${appName}-${goos}-${arch_suffix}.exe"
+    fi
+    
+    # 创建输出目录
+    local output_dir="build"
+    mkdir -p "$output_dir"
+    
+    # 准备编译命令
+    local env_vars="GOOS=$goos GOARCH=$goarch"
+    if [[ -n "$goarm" ]]; then
+        env_vars="$env_vars GOARM=$goarm"
+    fi
+    if [[ -n "$gomips" ]]; then
+        env_vars="$env_vars GOMIPS=$gomips"
+    fi
+    
+    #if [[ -n "$SOURCE_FILE" ]]; then
+    #    local build_cmd="$env_vars go build -trimpath -ldflags='-s -w' -o '${output_dir}/${output_name}' $SOURCE_FILE"
+    #else
+    #    local build_cmd="$env_vars go build -trimpath -ldflags='-s -w' -o '${output_dir}/${output_name}'"
+    #fi
+
+    local build_cmd="$env_vars go build -trimpath -ldflags='-s -w' -o '${output_dir}/${output_name}'"
+
+    # 执行编译
+    if eval "$build_cmd" 2>/dev/null; then
+        local file_size=$(du -h "${output_dir}/${output_name}" | cut -f1)
+        echo -e "✓ ${platform} 编译成功 (${file_size})"
+        echo -e "  输出文件: ${output_dir}/${output_name}"
+    else
+        echo -e "✗ ${platform} 编译失败"
+    fi
+}
+
 # ========================================
 # 主入口：直接调用 OpenList 的 release 逻辑（只多打几个）
 # ========================================
 BuildRelease() {
   rm -rf build
   mkdir -p build
+
+  #build_single "android/386"
+  #build_single "android/amd64"
+  #build_single "android/arm"
+  #build_single "android/arm64"
+  #build_single "darwin/386"
+  #build_single "darwin/amd64"
+  #build_single "darwin/arm"
+  #build_single "darwin/arm64"
+  #build_single "dragonfly/amd64"
+  #build_single "freebsd/386"
+  #build_single "freebsd/amd64"
+  #build_single "freebsd/arm"
+  #build_single "freebsd/arm64"
+  #build_single "linux/386"
+  #build_single "linux/amd64" 
+  #build_single "linux/armv5"
+  #build_single "linux/armv6"
+  #build_single "linux/armv7"
+  #build_single "linux/arm64"
+  #build_single "linux/mips-hard"
+  #build_single "linux/mips-soft"
+  #build_single "linux/mips64" 
+  #build_single "linux/mipsle-hard"
+  #build_single "linux/mipsle-soft"
+  #build_single "linux/mips64le" 
+  #build_single "linux/ppc64"
+  #build_single "linux/ppc64le"
+  #build_single "linux/riscv64"
+  #build_single "linux/s390x"
+  #build_single "netbsd/386"
+  #build_single "netbsd/amd64"
+  #build_single "netbsd/arm"
+  #build_single "netbsd/arm64"
+  #build_single "openbsd/386"
+  #build_single "openbsd/amd64"
+  #build_single "openbsd/arm"
+  #build_single "openbsd/arm64"
+  #build_single "plan9/386"
+  #build_single "plan9/amd64"
+  #build_single "solaris/amd64"
+  #build_single "windows/386"
+  #build_single "windows/amd64"
+  #build_single "windows/arm"
+  #build_single "windows/arm64"
 
   # 1. xgo 打主流 + FreeBSD + armv5 + s390x
   docker pull crazymax/xgo:latest
