@@ -171,6 +171,18 @@ MakeRelease() {
   for i in $(find . -type f -name "$appName-freebsd-*"); do
     tar -czvf compress/"$i".tar.gz "$i"
   done
+  for i in $(find . -type f -name "$appName-dragonfly-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-netbsd-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-openbsd-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
+  for i in $(find . -type f -name "$appName-plan9-*"); do
+    tar -czvf compress/"$i".tar.gz "$i"
+  done
   for i in $(find . -type f \( -name "$appName-windows-*" -o -name "$appName-windows7-*" \)); do
     zip compress/$(echo $i | sed 's/\.[^.]*$//').zip "$i"
   done
@@ -367,6 +379,28 @@ BuildRelease() {
   #build_single "windows/amd64"
   #build_single "windows/arm"
   #build_single "windows/arm64"
+
+  build_single "darwin/386"
+  build_single "darwin/arm"
+  build_single "dragonfly/amd64"
+  build_single "freebsd/arm"
+  build_single "linux/mips-hard"
+  build_single "linux/mips-soft"
+  build_single "linux/mipsle-hard"
+  build_single "linux/mipsle-soft"
+  build_single "linux/ppc64"
+  build_single "netbsd/386"
+  build_single "netbsd/amd64"
+  build_single "netbsd/arm"
+  build_single "netbsd/arm64"
+  build_single "openbsd/386"
+  build_single "openbsd/amd64"
+  build_single "openbsd/arm"
+  build_single "openbsd/arm64"
+  build_single "plan9/386"
+  build_single "plan9/amd64"
+  build_single "solaris/amd64"
+  build_single "windows/arm"
 
   # 1. xgo 打主流 + FreeBSD + armv5 + s390x
   docker pull crazymax/xgo:latest
