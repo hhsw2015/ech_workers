@@ -36,8 +36,10 @@ jobs:
           gcc -Wall -Wextra -std=c99 -finput-charset=UTF-8 -fexec-charset=GBK -Os -s -o ech-workers-gui.exe resource.o main.c -luser32 -lkernel32 -lcomctl32 -lgdi32 -mwindows
 
       - name: Upload assets
-        uses: softprops/action-gh-release@v2
-        with:
-          files: ech-workers-windows-gui-src/ech-workers-gui.exe
-          prerelease: false
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ech-workers-windows-gui-src/ech-workers-gui.exe
           tag_name: ${{ inputs.version }}
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
