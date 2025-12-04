@@ -32,7 +32,7 @@ var (
 	token      string
 	dnsServer  string
 	echDomain  string
-	proxyIP    string // 新增：代理服务器 IP
+	proxyIP    string
 
 	echListMu sync.RWMutex
 	echList   []byte
@@ -45,7 +45,7 @@ func init() {
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
-	flag.StringVar(&proxyIP, "pyip", "", "代理服务器 IP（用于 Worker 连接回退）")
+	flag.StringVar(&proxyIP, "pyip", "", "代理服务器 IP（用于 Worker 连接回退，proxyip）")
 }
 
 func main() {
@@ -147,7 +147,7 @@ func queryDoH(domain, dohURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("无效的 DoH URL: %v", err)
 	}
-	
+
 	dnsQuery := buildDNSQuery(domain, typeHTTPS)
 	dnsBase64 := base64.RawURLEncoding.EncodeToString(dnsQuery)
 
@@ -304,19 +304,10 @@ func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
 			if err != nil {
 				return nil, err
 			}
-			// IPv6 支持
-			ipHost := serverIP
-			userHost, userPort, splitErr := net.SplitHostPort(serverIP)
-			if splitErr == nil {
-				// 如果 serverIP 带端口，剥离并使用它（覆盖原 port）
-				ipHost = userHost
-				port = userPort // 覆盖原 port（如果不想覆盖，注释此行）
-			} // else: 无端口或无效格式，使用原 serverIP + 原 port
-			return net.DialTimeout(network, net.JoinHostPort(ipHost, port), 10*time.Second)
-			//dialer := &net.Dialer{
-			//	Timeout: 10 * time.Second,
-			//}
-			//return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
+			dialer := &net.Dialer{
+				Timeout: 10 * time.Second,
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
 		}
 	}
 
@@ -405,7 +396,14 @@ func dialWebSocketWithECH(maxRetries int) (*websocket.Conn, error) {
 				if err != nil {
 					return nil, err
 				}
-				return net.DialTimeout(network, net.JoinHostPort(serverIP, port), 10*time.Second)
+				//支持优选(非标端口), IPv6 支持
+				ipHost := serverIP
+				userHost, userPort, splitErr := net.SplitHostPort(serverIP)
+				if splitErr == nil {
+					ipHost = userHost
+					port = userPort
+				}
+				return net.DialTimeout(network, net.JoinHostPort(ipHost, port), 10*time.Second)
 			}
 		}
 
@@ -440,7 +438,6 @@ func runProxyServer(addr string) {
 	if serverIP != "" {
 		log.Printf("[代理] 使用固定 IP: %s", serverIP)
 	}
-
 	if proxyIP != "" {
 		log.Printf("[代理] 回退代理 IP: %s", proxyIP)
 	}
@@ -929,7 +926,7 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 	if proxyIP != "" {
 		connectMsg = fmt.Sprintf("CONNECT:%s|%s|%s", target, firstFrame, proxyIP)
 	}
-	
+
 	mu.Lock()
 	err = wsConn.WriteMessage(websocket.TextMessage, []byte(connectMsg))
 	mu.Unlock()
