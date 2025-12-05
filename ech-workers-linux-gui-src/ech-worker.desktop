@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=ECH Worker GUI
+Comment=ECH Worker 图形界面客户端
+Exec=bash -c "python3 ~/.local/bin/ECH-gui/ech_worker_gui.py"
+Icon=soundcloud
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+StartupNotify=true
