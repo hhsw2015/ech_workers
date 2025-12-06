@@ -43,6 +43,9 @@ class ECHWorkerGUI(Gtk.Window):
         self.config_dir = os.path.dirname(os.path.abspath(__file__))
         self.current_config_name = "默认配置"  # 默认配置名称
         
+        # 日志输出控制状态，默认关闭
+        self.log_output_enabled = False
+        
         # 创建主布局
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
         self.add(main_box)
@@ -159,10 +162,25 @@ class ECHWorkerGUI(Gtk.Window):
         self.status_label.set_halign(Gtk.Align.START)  # 左对齐状态标签
         content_box.pack_start(self.status_label, False, True, 0)  # 允许水平填充但不垂直扩展
         
-        # 添加日志窗口标签
+        # 添加日志窗口标签和开关
+        log_header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        log_header_box.set_halign(Gtk.Align.START)
+        main_box.pack_start(log_header_box, False, True, 0)
+        
+        # 程序日志标签
         log_label = Gtk.Label(label="程序日志")
         log_label.set_halign(Gtk.Align.START)
-        main_box.pack_start(log_label, False, True, 0)
+        log_header_box.pack_start(log_label, False, False, 0)
+        
+        # 输出日志开关
+        log_switch_label = Gtk.Label(label="输出日志")
+        log_switch_label.set_halign(Gtk.Align.START)
+        log_header_box.pack_start(log_switch_label, False, False, 0)
+        
+        self.log_switch = Gtk.Switch()
+        self.log_switch.set_active(False)  # 默认关闭
+        self.log_switch.connect("notify::active", self.on_log_switch_toggled)
+        log_header_box.pack_start(self.log_switch, False, False, 0)
         
         # 创建日志窗口 - 使用ScrolledWindow和TextView
         self.log_scrolled_window = Gtk.ScrolledWindow()
@@ -331,7 +349,6 @@ class ECHWorkerGUI(Gtk.Window):
                 self.append_log("错误: 配置名称不能为空")
         
         dialog.destroy()
-    
     def on_delete_config_clicked(self, widget):
         """删除当前选中的配置"""
         # 不能删除默认配置
@@ -363,8 +380,26 @@ class ECHWorkerGUI(Gtk.Window):
         
         dialog.destroy()
     
+    def on_log_switch_toggled(self, switch, gparam):
+        """当日志开关切换时调用"""
+        self.log_output_enabled = switch.get_active()
+        if self.log_output_enabled:
+            self.append_log("日志输出已开启")
+        else:
+            # 即使日志关闭也输出这条信息，所以直接使用buffer操作
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            log_message = f"[{timestamp}] 日志输出已关闭\n"
+            end_iter = self.log_buffer.get_end_iter()
+            self.log_buffer.insert(end_iter, log_message)
+            self.log_textview.scroll_mark_onscreen(self.log_buffer.get_insert())
+    
     def append_log(self, message):
         """在日志窗口中添加一条消息，最多保留20行"""
+        # 检查日志输出是否启用
+        if not self.log_output_enabled:
+            return
+        
         # 获取当前时间
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -375,16 +410,34 @@ class ECHWorkerGUI(Gtk.Window):
         self.log_buffer.insert(end_iter, log_message)
         
         # 限制日志行数不超过20行
-        text = self.log_buffer.get_text(self.log_buffer.get_start_iter(), end_iter, True)
+        start_iter = self.log_buffer.get_start_iter()
+        end_iter = self.log_buffer.get_end_iter()
+        text = self.log_buffer.get_text(start_iter, end_iter, True)
         lines = text.split('\n')
         if len(lines) > 20:
             # 只保留最后20行
             new_text = '\n'.join(lines[-20:])
             self.log_buffer.set_text(new_text)
         
-        # 滚动到底部
-        self.log_textview.scroll_mark_onscreen(self.log_buffer.get_insert())
+        # 强制刷新视图并滚动到底部
+        # 使用idle_add确保滚动操作在UI线程中执行
+        GLib.idle_add(self._scroll_to_bottom)
     
+    def _scroll_to_bottom(self):
+        """滚动到日志底部"""
+        try:
+            # 确保在UI线程中执行
+            end_iter = self.log_buffer.get_end_iter()
+            self.log_buffer.place_cursor(end_iter)
+            self.log_textview.scroll_to_iter(end_iter, 0.0, False, 0, 0)
+            # 也可以使用mark的方式滚动
+            mark = self.log_buffer.get_insert()
+            self.log_textview.scroll_mark_onscreen(mark)
+        except Exception as e:
+            # 忽略滚动错误，不影响主要功能
+            pass
+        return False  # 不重复执行
+
     def set_label_color(self, label, color_hex):
         """使用CSS设置标签颜色"""
         css_provider = Gtk.CssProvider()
@@ -796,15 +849,20 @@ class ECHWorkerGUI(Gtk.Window):
             GLib.idle_add(self.append_log, "服务已成功启动")
             
             # 等待1秒让服务完全初始化
-            time.sleep(0.8)
+            time.sleep(1.0)
             
-            # 进行第一次延迟测试
-            self.update_latency()
+            # 在单独的线程中进行延迟测试，避免阻塞日志输出
+            def delayed_latency_test():
+                time.sleep(1.0)  # 额外等待1秒确保服务稳定
+                # 使用GLib.idle_add确保在主线程中更新UI
+                GLib.idle_add(self._perform_latency_test)
             
-            # 设置定时器，每3分钟(180秒)重新测试一次延迟
-            self.latency_timer = GLib.timeout_add_seconds(180, self.update_latency)
+            # 启动延迟测试线程
+            latency_thread = threading.Thread(target=delayed_latency_test)
+            latency_thread.daemon = True
+            latency_thread.start()
             
-            # 读取输出
+            # 立即开始读取输出，不等待延迟测试完成
             for line in iter(self.running_process.stdout.readline, ''):
                 if line.strip():
                     GLib.idle_add(self.append_log, line.strip())
@@ -840,6 +898,46 @@ class ECHWorkerGUI(Gtk.Window):
         finally:
             self.running_process = None
             self.process_thread = None
+    
+    def _perform_latency_test(self):
+        """在主线程中执行延迟测试"""
+        try:
+            # 进行延迟测试
+            latency, color = self.test_latency()
+            if latency is not None:
+                # 显示延迟测试结果
+                self.status_label.set_text(f"服务已启动 - 延迟: {latency} 毫秒")
+                if color:
+                    self.status_label.override_color(Gtk.StateFlags.NORMAL, color)
+                self.append_log(f"延迟测试结果: {latency} 毫秒")
+            else:
+                # 测试失败
+                self.append_log("延迟测试失败: 无法连接到服务或超时")
+            # 设置定时器，每3分钟(180秒)重新测试一次延迟
+            self.latency_timer = GLib.timeout_add_seconds(180, self._scheduled_latency_test)
+        except Exception as e:
+            self.append_log(f"执行延迟测试时出错: {str(e)}")
+    
+    def _scheduled_latency_test(self):
+        """定时执行的延迟测试"""
+        try:
+            # 进行延迟测试
+            latency, color = self.test_latency()
+            if latency is not None:
+                # 显示延迟测试结果
+                self.status_label.set_text(f"服务已启动 - 延迟: {latency} 毫秒")
+                if color:
+                    self.status_label.override_color(Gtk.StateFlags.NORMAL, color)
+                self.append_log(f"延迟测试结果: {latency} 毫秒")
+            else:
+                # 测试失败
+                self.append_log("延迟测试失败: 无法连接到服务或超时")
+        except Exception as e:
+            self.append_log(f"执行延迟测试时出错: {str(e)}")
+        
+        # 返回True以保持定时器继续运行
+        return True
+
 
 
 def main():
