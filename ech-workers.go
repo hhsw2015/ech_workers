@@ -2,8 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
@@ -37,6 +35,15 @@ var (
 	echListMu sync.RWMutex
 	echList   []byte
 )
+
+// ======================== 缓冲区池 ========================
+
+// bufPool 用于复用 32KB 的缓冲区
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 32*1024) // 32KB 缓冲区
+	},
+}
 
 func init() {
 	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
@@ -280,74 +287,6 @@ func parseHTTPSRecord(data []byte) string {
 	return ""
 }
 
-// ======================== DoH 代理支持 ========================
-
-// queryDoHForProxy 通过 ECH 转发 DNS 查询到 Cloudflare DoH
-func queryDoHForProxy(dnsQuery []byte) ([]byte, error) {
-	_, port, _, err := parseServerAddr(serverAddr)
-	if err != nil {
-		return nil, err
-	}
-
-	// 构建 DoH URL
-	dohURL := fmt.Sprintf("https://cloudflare-dns.com:%s/dns-query", port)
-
-	echBytes, err := getECHList()
-	if err != nil {
-		return nil, fmt.Errorf("获取 ECH 配置失败: %w", err)
-	}
-
-	tlsCfg, err := buildTLSConfigWithECH("cloudflare-dns.com", echBytes)
-	if err != nil {
-		return nil, fmt.Errorf("构建 TLS 配置失败: %w", err)
-	}
-
-	// 创建 HTTP 客户端
-	transport := &http.Transport{
-		TLSClientConfig: tlsCfg,
-	}
-
-	// 如果指定了 IP，使用自定义 Dialer
-	if serverIP != "" {
-		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			_, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			dialer := &net.Dialer{
-				Timeout: 10 * time.Second,
-			}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(serverIP, port))
-		}
-	}
-
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   10 * time.Second,
-	}
-
-	// 发送 DoH 请求
-	req, err := http.NewRequest("POST", dohURL, bytes.NewReader(dnsQuery))
-	if err != nil {
-		return nil, err
-	}
-
-	req.Header.Set("Content-Type", "application/dns-message")
-	req.Header.Set("Accept", "application/dns-message")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("DoH 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("DoH 响应错误: %d", resp.StatusCode)
-	}
-
-	return io.ReadAll(resp.Body)
-}
-
 // ======================== WebSocket 客户端 ========================
 
 func parseServerAddr(addr string) (host, port, path string, err error) {
@@ -586,194 +525,27 @@ func handleSOCKS5(conn net.Conn, clientAddr string, firstByte byte) {
 	}
 	port := int(buf[0])<<8 | int(buf[1])
 
-	switch command {
-	case 0x01: // CONNECT
-		var target string
-		if atyp == 0x04 {
-			target = fmt.Sprintf("[%s]:%d", host, port)
-		} else {
-			target = fmt.Sprintf("%s:%d", host, port)
-		}
-
-		log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
-
-		if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, nil); err != nil {
-			if !isNormalCloseError(err) {
-				log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
-			}
-		}
-
-	case 0x03: // UDP ASSOCIATE
-		handleUDPAssociate(conn, clientAddr)
-
-	default:
+	// 只支持 CONNECT 命令（TCP 连接）
+	if command != 0x01 {
+		log.Printf("[SOCKS5] %s 不支持的命令: 0x%02x", clientAddr, command)
 		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 		return
 	}
-}
 
-func handleUDPAssociate(tcpConn net.Conn, clientAddr string) {
-	if tcpConn == nil {
-		return
+	var target string
+	if atyp == 0x04 {
+		target = fmt.Sprintf("[%s]:%d", host, port)
+	} else {
+		target = fmt.Sprintf("%s:%d", host, port)
 	}
 
-	// 创建 UDP 监听器
-	udpAddr, err := net.ResolveUDPAddr("udp", "127.0.0.1:0")
-	if err != nil {
-		log.Printf("[UDP] %s 解析地址失败: %v", clientAddr, err)
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
+	log.Printf("[SOCKS5] %s -> %s", clientAddr, target)
 
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Printf("[UDP] %s 监听失败: %v", clientAddr, err)
-		tcpConn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
-		return
-	}
-
-	// 获取实际监听的端口
-	localAddr := udpConn.LocalAddr().(*net.UDPAddr)
-	port := localAddr.Port
-
-	log.Printf("[UDP] %s UDP ASSOCIATE 监听端口: %d", clientAddr, port)
-
-	// 发送成功响应
-	response := []byte{0x05, 0x00, 0x00, 0x01}
-	response = append(response, 127, 0, 0, 1) // 127.0.0.1
-	response = append(response, byte(port>>8), byte(port&0xff))
-
-	if _, err := tcpConn.Write(response); err != nil {
-		udpConn.Close()
-		return
-	}
-
-	// 启动 UDP 处理
-	stopChan := make(chan struct{})
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go handleUDPRelay(udpConn, clientAddr, stopChan, &wg)
-
-	// 保持 TCP 连接，直到客户端关闭
-	buf := make([]byte, 1)
-	tcpConn.Read(buf)
-
-	close(stopChan)
-	wg.Wait() // 等待 goroutine 回收
-	udpConn.Close()
-	log.Printf("[UDP] %s UDP ASSOCIATE 连接关闭", clientAddr)
-}
-
-func handleUDPRelay(udpConn *net.UDPConn, clientAddr string, stopChan chan struct{}, wg *sync.WaitGroup) {
-	defer wg.Done()
-	buf := make([]byte, 65535)
-	for {
-		select {
-		case <-stopChan:
-			return
-		default:
-		}
-
-		udpConn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		n, addr, err := udpConn.ReadFromUDP(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				continue
-			}
-			return
-		}
-
-		// 解析 SOCKS5 UDP 请求头
-		if n < 10 {
-			continue
-		}
-
-		// SOCKS5 UDP 请求格式:
-		// +----+------+------+----------+----------+----------+
-		// |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
-		// +----+------+------+----------+----------+----------+
-		// | 2  |  1   |  1   | Variable |    2     | Variable |
-		// +----+------+------+----------+----------+----------+
-
-		data := buf[:n]
-
-		if data[2] != 0x00 { // FRAG 必须为 0
-			continue
-		}
-
-		atyp := data[3]
-		var headerLen int
-		var dstHost string
-		var dstPort int
-
-		switch atyp {
-		case 0x01: // IPv4
-			if n < 10 {
-				continue
-			}
-			dstHost = net.IP(data[4:8]).String()
-			dstPort = int(data[8])<<8 | int(data[9])
-			headerLen = 10
-
-		case 0x03: // 域名
-			if n < 5 {
-				continue
-			}
-			domainLen := int(data[4])
-			if n < 7+domainLen {
-				continue
-			}
-			dstHost = string(data[5 : 5+domainLen])
-			dstPort = int(data[5+domainLen])<<8 | int(data[6+domainLen])
-			headerLen = 7 + domainLen
-
-		case 0x04: // IPv6
-			if n < 22 {
-				continue
-			}
-			dstHost = net.IP(data[4:20]).String()
-			dstPort = int(data[20])<<8 | int(data[21])
-			headerLen = 22
-
-		default:
-			continue
-		}
-
-		udpData := data[headerLen:]
-		target := fmt.Sprintf("%s:%d", dstHost, dstPort)
-
-		// 检查是否是 DNS 查询（端口 53）
-		if dstPort == 53 {
-			log.Printf("[UDP-DNS] %s -> %s (DoH 查询)", clientAddr, target)
-			go handleDNSQuery(udpConn, addr, udpData, data[:headerLen])
-		} else {
-			log.Printf("[UDP] %s -> %s (暂不支持非 DNS UDP)", clientAddr, target)
-			// 这里可以扩展支持其他 UDP 流量
+	if err := handleTunnel(conn, target, clientAddr, modeSOCKS5, nil); err != nil {
+		if !isNormalCloseError(err) {
+			log.Printf("[SOCKS5] %s 代理失败: %v", clientAddr, err)
 		}
 	}
-}
-
-func handleDNSQuery(udpConn *net.UDPConn, clientAddr *net.UDPAddr, dnsQuery []byte, socks5Header []byte) {
-	// 通过 DoH 查询（使用重命名后的函数）
-	dnsResponse, err := queryDoHForProxy(dnsQuery)
-	if err != nil {
-		log.Printf("[UDP-DNS] DoH 查询失败: %v", err)
-		return
-	}
-
-	// 构建 SOCKS5 UDP 响应
-	response := make([]byte, 0, len(socks5Header)+len(dnsResponse))
-	response = append(response, socks5Header...)
-	response = append(response, dnsResponse...)
-
-	// 发送响应
-	_, err = udpConn.WriteToUDP(response, clientAddr)
-	if err != nil {
-		log.Printf("[UDP-DNS] 发送响应失败: %v", err)
-		return
-	}
-
-	log.Printf("[UDP-DNS] DoH 查询成功，响应 %d 字节", len(dnsResponse))
 }
 
 // ======================== HTTP 处理 ========================
@@ -895,10 +667,10 @@ func handleHTTP(conn net.Conn, clientAddr string, firstByte byte) {
 			}
 		}
 
-		firstFrame := requestBuilder.String()
+		firstFrame := []byte(requestBuilder.String())
 
 		// 使用 modeHTTPProxy 模式（不发送 200 响应）
-		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, []byte(firstFrame)); err != nil {
+		if err := handleTunnel(conn, target, clientAddr, modeHTTPProxy, firstFrame); err != nil {
 			if !isNormalCloseError(err) {
 				log.Printf("[HTTP-%s] %s 代理失败: %v", method, clientAddr, err)
 			}
@@ -959,16 +731,20 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 	// 如果没有预设的 firstFrame，尝试读取第一帧数据（仅 SOCKS5）
 	if firstFrame == nil && mode == modeSOCKS5 {
 		_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-		buffer := make([]byte, 32*1024) // 限制最大读取 32KB
+		// 使用池化的缓冲区
+		buffer := bufPool.Get().([]byte)
 		n, _ := conn.Read(buffer)
 		_ = conn.SetReadDeadline(time.Time{})
 		if n > 0 && n <= 32*1024 {
-			firstFrame = buffer[:n]
+			firstFrame = make([]byte, n)
+			copy(firstFrame, buffer[:n])
 		} else if n > 32*1024 {
-			firstFrame = buffer[:32*1024]
+			firstFrame = make([]byte, 32*1024)
+			copy(firstFrame, buffer[:32*1024])
 		} else {
 			firstFrame = nil
 		}
+		bufPool.Put(buffer)
 	}
 
 	// 构建连接消息，包含代理 IP 信息
@@ -1022,7 +798,10 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 
 	// Client -> Server
 	go func() {
-		buf := make([]byte, 32768)
+		// 使用池化的缓冲区
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
+
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
