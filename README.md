@@ -28,21 +28,29 @@ ExecStart=/usr/local/bin/ech-workers \
 Restart=on-failure  # 仅在失败时重启，而不是一直重启
 RestartSec=10       # 重启间隔增加到10秒
 RestartPreventExitStatus=0  # 正常退出时不重启
-
 [Install]
+
 WantedBy=multi-user.target
-
-
 3. 重新加载systemd配置并启动服务
 bash
 # 重新加载systemd配置
 sudo systemctl daemon-reload
-
 # 启动服务
 sudo systemctl start ech-workers
-
 # 设置开机自启
 sudo systemctl enable ech-workers
-
 # 检查服务状态
 sudo systemctl status ech-workers
+
+## 🍏 iOS 构建
+
+### 构建未签名 IPA
+```bash
+# 安装依赖
+go install golang.org/x/mobile/cmd/gomobile@latest
+gomobile init
+
+# 构建 iOS 应用
+chmod +x scripts/build-ios.sh
+./scripts/build-ios.sh
+
