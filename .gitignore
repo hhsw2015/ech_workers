@@ -1,0 +1,5 @@
+# iOS 构建产物
+ios/bridge/EchWorkers.xcframework
+Payload/
+*.ipa
+DerivedData/
