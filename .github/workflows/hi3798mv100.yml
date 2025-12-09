@@ -1,62 +1,306 @@
-name: Simple Build for ARMv7
+name: Build for Hi3798MV100 (Fixed)
 
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
+  release:
+    types: [created]
 
 jobs:
-  build:
+  build-hi3798:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     
-    - name: Setup Go
+    - name: Set up Go
       uses: actions/setup-go@v4
       with:
         go-version: '1.21'
+        cache: true
     
-    - name: Install ARM compiler
+    - name: Install musl cross compiler (Fixed)
       run: |
-        # 安装 ARM 交叉编译器
-        sudo apt-get update
-        sudo apt-get install -y gcc-arm-linux-gnueabihf
+        echo "安装交叉编译工具链..."
         
-        # 安装 musl 工具
+        # 方法1: 使用 musl.cc（最简单）
+        echo "方法1: 使用 musl.cc 工具链"
         wget -q https://musl.cc/arm-linux-musleabihf-cross.tgz
         tar -xzf arm-linux-musleabihf-cross.tgz
-        echo "$PWD/arm-linux-musleabihf-cross/bin" >> $GITHUB_PATH
-    
-    - name: Build
-      run: |
-        # 纯 Go 版本（最简单，无依赖）
-        echo "构建纯 Go 版本..."
-        GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
-          go build -o ech-workers-armv7 \
-          -ldflags="-w -s" .
+        export PATH="$PWD/arm-linux-musleabihf-cross/bin:$PATH"
         
-        # 尝试静态编译（如果工具链可用）
-        if command -v arm-linux-musleabihf-gcc >/dev/null 2>&1; then
-          echo "构建 musl 静态版本..."
-          CC=arm-linux-musleabihf-gcc \
-          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=1 \
-            go build -a -o ech-workers-armv7-static \
-            -ldflags="-w -s -linkmode external -extldflags '-static'" .
-        fi
-    
-    - name: Verify and package
-      run: |
-        echo "验证构建结果:"
-        ls -lh ech-workers-*
-        file ech-workers-*
+        # 验证
+        echo "验证工具链..."
+        arm-linux-musleabihf-gcc --version
         
+        # 方法2: 使用 apt 安装（备用）
+        echo "方法2: 安装备用工具链"
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-arm-linux-gnueabihf \
+          gcc-aarch64-linux-gnu \
+          musl-tools
+        
+        # 创建符号链接
+        sudo ln -sf /usr/bin/arm-linux-gnueabihf-gcc /usr/local/bin/arm-linux-musleabihf-gcc 2>/dev/null || true
+    
+    - name: Build static binary
+      run: |
+        echo "开始构建..."
+        
+        # 设置环境变量
+        export CC="arm-linux-musleabihf-gcc"
+        export GOOS="linux"
+        export GOARCH="arm"
+        export GOARM="7"
+        export CGO_ENABLED="1"
+        
+        # 版本信息
+        VERSION="v1.0.0-$(date +%Y%m%d)"
+        COMMIT=$(git rev-parse --short HEAD)
+        DATE=$(date -u '+%Y-%m-%d_%H:%M:%S')
+        
+        echo "构建信息:"
+        echo "- 版本: $VERSION"
+        echo "- Commit: $COMMIT"
+        echo "- 日期: $DATE"
+        echo "- 编译器: $CC"
+        which $CC
+        
+        # 静态编译
+        echo "执行静态编译..."
+        go build -a -v \
+          -o "ech-workers-hi3798mv100" \
+          -ldflags="-w -s \
+            -linkmode external \
+            -extldflags '-static' \
+            -X 'main.version=$VERSION' \
+            -X 'main.commit=$COMMIT' \
+            -X 'main.buildTime=$DATE'" \
+          .
+        
+        # 验证文件
+        echo "验证构建结果..."
+        file ech-workers-hi3798mv100
+        ls -lh ech-workers-hi3798mv100
+        
+        # 检查是否静态链接
+        echo "检查链接状态..."
+        ldd ech-workers-hi3798mv100 2>&1 | grep -q "not a dynamic" && \
+          echo "✓ 静态链接成功" || \
+          echo "⚠ 可能不是完全静态"
+    
+    - name: Build pure Go version (fallback)
+      run: |
+        echo "构建纯 Go 版本（备用）..."
+        
+        export GOOS="linux"
+        export GOARCH="arm"
+        export GOARM="7"
+        export CGO_ENABLED="0"
+        
+        VERSION="v1.0.0-purego-$(date +%Y%m%d)"
+        
+        go build \
+          -o "ech-workers-hi3798mv100-purego" \
+          -ldflags="-w -s -X 'main.version=$VERSION'" \
+          .
+        
+        file ech-workers-hi3798mv100-purego
+        ls -lh ech-workers-hi3798mv100-purego
+    
+    - name: Create checksums
+      run: |
+        echo "创建校验和..."
+        for file in ech-workers-hi3798mv100*; do
+          if [ -f "$file" ] && [[ "$file" != *.sha256 ]] && [[ "$file" != *.md5 ]]; then
+            sha256sum "$file" > "$file.sha256"
+            md5sum "$file" > "$file.md5"
+            echo "  $file:"
+            cat "$file.sha256"
+          fi
+        done
+    
+    - name: Create release package
+      run: |
         echo "创建发布包..."
         mkdir -p release
-        cp ech-workers-armv7* release/ 2>/dev/null || true
-        tar -czf release/ech-workers-armv7.tar.gz -C release .
+        
+        # 复制文件
+        cp ech-workers-hi3798mv100* release/ 2>/dev/null || true
+        
+        # 创建安装脚本
+        cat > release/install.sh << 'EOF'
+        #!/bin/bash
+        # ech-workers Hi3798MV100 安装脚本
+        
+        set -e
+        
+        echo "========================================"
+        echo "  ech-workers Hi3798MV100 安装程序"
+        echo "========================================"
+        
+        # 默认参数
+        DEVICE_IP=""
+        INSTALL_DIR="/usr/local/bin"
+        SERVICE_NAME="ech-workers"
+        
+        # 解析参数
+        while [[ $# -gt 0 ]]; do
+          case $1 in
+            -h|--help)
+              echo "使用方法: $0 [选项] <设备IP>"
+              echo "选项:"
+              echo "  -h, --help     显示帮助"
+              echo "  -d, --dir DIR  安装目录 (默认: /usr/local/bin)"
+              echo "  -s, --service  创建 systemd 服务"
+              exit 0
+              ;;
+            -d|--dir)
+              INSTALL_DIR="$2"
+              shift 2
+              ;;
+            -s|--service)
+              CREATE_SERVICE=1
+              shift
+              ;;
+            *)
+              DEVICE_IP="$1"
+              shift
+              ;;
+          esac
+        done
+        
+        if [ -z "$DEVICE_IP" ]; then
+          echo "错误: 必须指定设备IP地址"
+          echo "示例: $0 192.168.1.100"
+          exit 1
+        fi
+        
+        # 选择要安装的版本
+        echo "选择安装版本:"
+        echo "1) 静态版本 (ech-workers-hi3798mv100)"
+        echo "2) 纯Go版本 (ech-workers-hi3798mv100-purego)"
+        read -p "请输入选择 [1-2] (默认 1): " choice
+        choice=${choice:-1}
+        
+        case $choice in
+          1) BINARY="ech-workers-hi3798mv100" ;;
+          2) BINARY="ech-workers-hi3798mv100-purego" ;;
+          *) BINARY="ech-workers-hi3798mv100" ;;
+        esac
+        
+        if [ ! -f "$BINARY" ]; then
+          echo "错误: 找不到文件 $BINARY"
+          exit 1
+        fi
+        
+        echo "安装信息:"
+        echo "- 设备: $DEVICE_IP"
+        echo "- 版本: $BINARY"
+        echo "- 目录: $INSTALL_DIR"
+        
+        # 传输文件
+        echo -e "\n传输文件..."
+        scp "$BINARY" root@${DEVICE_IP}:/tmp/ech-workers-new
+        scp "$BINARY.sha256" root@${DEVICE_IP}:/tmp/ 2>/dev/null || true
+        
+        # 执行安装
+        echo -e "\n正在安装..."
+        ssh root@${DEVICE_IP} << SSH_EOF
+        set -e
+        
+        echo "备份旧版本..."
+        if [ -f "$INSTALL_DIR/ech-workers" ]; then
+          BACKUP="\$INSTALL_DIR/ech-workers.backup.\$(date +%Y%m%d_%H%M%S)"
+          cp "\$INSTALL_DIR/ech-workers" "\$BACKUP"
+          echo "已备份到: \$BACKUP"
+        fi
+        
+        echo "安装新版本..."
+        cp /tmp/ech-workers-new "\$INSTALL_DIR/ech-workers"
+        chmod +x "\$INSTALL_DIR/ech-workers"
+        
+        echo -e "\n验证安装:"
+        file "\$INSTALL_DIR/ech-workers"
+        "\$INSTALL_DIR/ech-workers" --help 2>&1 | head -5
+        
+        # 创建 systemd 服务
+        if [ -n "$CREATE_SERVICE" ]; then
+          echo -e "\n创建 systemd 服务..."
+          cat > /etc/systemd/system/ech-workers.service << SERVICE_EOF
+        [Unit]
+        Description=ECH Workers Proxy
+        After=network.target
+        
+        [Service]
+        Type=simple
+        ExecStart=$INSTALL_DIR/ech-workers \\
+          -l 0.0.0.0:30000 \\
+          -f your-worker.workers.dev:443 \\
+          -token YOUR_TOKEN_HERE \\
+          -pyip backup.proxy.com:8080 \\
+          -ip 104.16.132.229
+        Restart=always
+        RestartSec=10
+        
+        [Install]
+        WantedBy=multi-user.target
+        SERVICE_EOF
+        
+          systemctl daemon-reload
+          systemctl enable ech-workers
+          echo "服务已创建并启用"
+        fi
+        
+        echo -e "\n安装完成!"
+        echo "运行命令: \$INSTALL_DIR/ech-workers [参数]"
+        SSH_EOF
+        
+        echo -e "\n✅ 安装完成!"
+        EOF
+        
+        chmod +x release/install.sh
+        
+        # 创建配置文件模板
+        cat > release/config-example.sh << 'EOF'
+        #!/bin/bash
+        # ech-workers 配置示例
+        
+        # 基本配置
+        LISTEN_ADDR="0.0.0.0:30000"
+        WORKER_URL="your-app.workers.dev:443"
+        TOKEN="your_token_here"
+        
+        # 高级配置
+        FALLBACK_PROXY="backup.proxy.com:8080"
+        TARGET_IP="104.16.132.229"
+        DNS_SERVER="1.1.1.1/dns-query"
+        ECH_DOMAIN="cloudflare-ech.com"
+        
+        # 运行命令
+        CMD="/usr/local/bin/ech-workers \
+          -l \"\$LISTEN_ADDR\" \
+          -f \"\$WORKER_URL\" \
+          -token \"\$TOKEN\" \
+          -pyip \"\$FALLBACK_PROXY\" \
+          -ip \"\$TARGET_IP\" \
+          -dns \"\$DNS_SERVER\" \
+          -ech \"\$ECH_DOMAIN\""
+        
+        echo "运行命令:"
+        echo \$CMD
+        # eval \$CMD
+        EOF
+        
+        chmod +x release/config-example.sh
     
-    - uses: actions/upload-artifact@v3
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
       with:
-        name: armv7-binaries
-        path: release/
+        name: hi3798mv100-build
+        path: |
+          ech-workers-hi3798mv100*
+          release/
+        retention-days: 30
