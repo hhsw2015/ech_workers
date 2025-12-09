@@ -1,0 +1,125 @@
+name: 🍏 Build iOS App
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'ios-*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag'
+        required: false
+        default: 'v1.0.0'
+
+env:
+  GO_VERSION: '1.21'
+  IOS_DEPLOYMENT_TARGET: '15.0'
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+    
+    - name: 🔧 Setup Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+    
+    - name: 🏗️ Setup iOS build environment
+      run: |
+        # 安装 gomobile
+        go install golang.org/x/mobile/cmd/gomobile@latest
+        ~/go/bin/gomobile init
+        
+        # 检查 Xcode 版本
+        xcodebuild -version
+        
+    - name: 🛠️ Build iOS framework
+      run: |
+        cd ios/bridge
+        
+        # 编译为 iOS 框架
+        ~/go/bin/gomobile bind -target=ios \
+          -ldflags="-w -s" \
+          -o EchWorkers.xcframework \
+          .
+        
+        ls -lh EchWorkers.xcframework
+    
+    - name: 📦 Create unsigned IPA
+      run: |
+        # 创建简单的 iOS 应用包
+        mkdir -p Payload
+        mkdir -p Payload/ECHWorkers.app
+        
+        # 创建 Info.plist
+        cat > Payload/ECHWorkers.app/Info.plist << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>ECH SOCKS5 Proxy</string>
+    <key>CFBundleExecutable</key>
+    <string>ECHWorkers</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.ech.workers.ios</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>ECHWorkers</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>UILaunchStoryboardName</key>
+    <string>LaunchScreen</string>
+    <key>UIMainStoryboardFile</key>
+    <string>Main</string>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>armv7</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+</dict>
+</plist>
+EOF
+        
+        # 压缩为 IPA
+        zip -qr ECHWorkers-unsigned.ipa Payload
+        
+    - name: 📤 Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ech-workers-ios
+        path: |
+          ECHWorkers-unsigned.ipa
+          ios/bridge/EchWorkers.xcframework
+        retention-days: 30
