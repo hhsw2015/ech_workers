@@ -1,0 +1,361 @@
+name: Build ARMv7 for Hi3798MV100
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 手动触发
+  schedule:
+    - cron: '0 0 * * 0'  # 每周日自动构建
+
+jobs:
+  build-armv7:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        repository: hhsw2015/ech_workers  # 原项目
+        fetch-depth: 0
+    
+    - name: Setup Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+        cache: true
+    
+    - name: Build pure Go version (ARMv7)
+      run: |
+        echo "构建 ARMv7 纯 Go 版本..."
+        
+        # 获取版本信息
+        VERSION="v1.0.0"
+        if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          VERSION="${GITHUB_REF#refs/tags/}"
+        fi
+        
+        COMMIT=$(git rev-parse --short HEAD)
+        DATE=$(date -u '+%Y-%m-%d_%H:%M:%S')
+        
+        echo "版本: $VERSION"
+        echo "提交: $COMMIT"
+        echo "日期: $DATE"
+        
+        # 纯 Go 交叉编译（最简单，无依赖）
+        GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=0 \
+          go build \
+          -o "ech-workers-ubuntu-armv7" \
+          -ldflags="-w -s \
+            -X 'main.version=$VERSION' \
+            -X 'main.commit=$COMMIT' \
+            -X 'main.date=$DATE'" \
+          .
+        
+        # 验证
+        echo "构建完成:"
+        file ech-workers-ubuntu-armv7
+        ls -lh ech-workers-ubuntu-armv7
+    
+    - name: Test with QEMU
+      run: |
+        echo "使用 QEMU 测试..."
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static
+        
+        chmod +x ech-workers-ubuntu-armv7
+        echo "测试运行帮助命令..."
+        timeout 3s qemu-arm-static ech-workers-ubuntu-armv7 --help 2>&1 | head -10 || \
+          echo "QEMU 测试完成"
+    
+    - name: Create checksums
+      run: |
+        echo "创建校验和..."
+        sha256sum ech-workers-ubuntu-armv7 > ech-workers-ubuntu-armv7.sha256
+        md5sum ech-workers-ubuntu-armv7 > ech-workers-ubuntu-armv7.md5
+        
+        echo "SHA256:"
+        cat ech-workers-ubuntu-armv7.sha256
+        echo "MD5:"
+        cat ech-workers-ubuntu-armv7.md5
+    
+    - name: Create Ubuntu ARMv7 package
+      run: |
+        echo "创建 Ubuntu ARMv7 安装包..."
+        mkdir -p release
+        
+        # 复制二进制文件
+        cp ech-workers-ubuntu-armv7* release/
+        
+        # 创建安装脚本
+        cat > release/install-ubuntu-armv7.sh << 'EOF'
+#!/bin/bash
+# ech-workers Ubuntu ARMv7 安装脚本
+
+set -e
+
+echo "=========================================="
+echo "  ech-workers Ubuntu ARMv7 安装程序"
+echo "=========================================="
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# 默认配置
+INSTALL_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/ech-workers"
+SERVICE_FILE="/etc/systemd/system/ech-workers.service"
+
+show_help() {
+    echo "用法: $0 [选项]"
+    echo ""
+    echo "选项:"
+    echo "  -h, --help      显示此帮助"
+    echo "  -d, --dir DIR   安装目录 (默认: /usr/local/bin)"
+    echo "  -s, --service   创建 systemd 服务"
+    echo "  -c, --config    生成配置文件"
+    echo ""
+    echo "示例:"
+    echo "  $0                   # 基本安装"
+    echo "  $0 -s                # 安装并创建服务"
+    echo "  $0 -d /opt/bin -s    # 指定目录并创建服务"
+}
+
+# 解析参数
+CREATE_SERVICE=0
+GENERATE_CONFIG=0
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -d|--dir)
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        -s|--service)
+            CREATE_SERVICE=1
+            shift
+            ;;
+        -c|--config)
+            GENERATE_CONFIG=1
+            shift
+            ;;
+        *)
+            echo -e "${RED}未知参数: $1${NC}"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+echo -e "${GREEN}安装目录:${NC} $INSTALL_DIR"
+echo -e "${GREEN}创建服务:${NC} $([ $CREATE_SERVICE -eq 1 ] && echo '是' || echo '否')"
+echo -e "${GREEN}生成配置:${NC} $([ $GENERATE_CONFIG -eq 1 ] && echo '是' || echo '否')"
+
+# 检查是否在 Ubuntu ARMv7 上运行
+echo -e "\n${YELLOW}[1/4] 检查系统环境...${NC}"
+ARCH=$(uname -m)
+if [[ "$ARCH" != "armv7l" ]] && [[ "$ARCH" != "armhf" ]]; then
+    echo -e "${RED}警告: 当前系统架构为 $ARCH，不是 ARMv7${NC}"
+    read -p "是否继续安装？(y/n): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+# 检查当前用户权限
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${YELLOW}提示: 需要 root 权限，使用 sudo 运行${NC}"
+    sudo "$0" "$@"
+    exit $?
+fi
+
+# 检查文件
+echo -e "\n${YELLOW}[2/4] 检查安装文件...${NC}"
+if [[ ! -f "ech-workers-ubuntu-armv7" ]]; then
+    echo -e "${RED}错误: 找不到 ech-workers-ubuntu-armv7 文件${NC}"
+    exit 1
+fi
+
+# 验证文件类型
+FILE_TYPE=$(file ech-workers-ubuntu-armv7)
+if [[ ! "$FILE_TYPE" == *"ARM"* ]] && [[ ! "$FILE_TYPE" == *"arm"* ]]; then
+    echo -e "${RED}警告: 文件可能不是 ARM 架构${NC}"
+    echo "文件类型: $FILE_TYPE"
+fi
+
+# 安装
+echo -e "\n${YELLOW}[3/4] 安装 ech-workers...${NC}"
+
+# 创建安装目录
+mkdir -p "$INSTALL_DIR"
+
+# 备份旧版本
+if [[ -f "$INSTALL_DIR/ech-workers" ]]; then
+    BACKUP="$INSTALL_DIR/ech-workers.backup.$(date +%Y%m%d_%H%M%S)"
+    echo "备份旧版本到: $BACKUP"
+    cp "$INSTALL_DIR/ech-workers" "$BACKUP"
+fi
+
+# 安装新版本
+cp ech-workers-ubuntu-armv7 "$INSTALL_DIR/ech-workers"
+chmod +x "$INSTALL_DIR/ech-workers"
+
+echo -e "${GREEN}✓ ech-workers 安装完成${NC}"
+
+# 验证安装
+echo -e "\n${YELLOW}验证安装...${NC}"
+echo "文件位置: $INSTALL_DIR/ech-workers"
+echo "文件信息:"
+file "$INSTALL_DIR/ech-workers"
+echo "文件大小:"
+ls -lh "$INSTALL_DIR/ech-workers"
+
+echo -e "\n${GREEN}版本信息:${NC}"
+"$INSTALL_DIR/ech-workers" --help 2>&1 | head -10 || echo "无法获取帮助信息"
+
+# 生成配置文件
+if [[ $GENERATE_CONFIG -eq 1 ]]; then
+    echo -e "\n${YELLOW}[4/4] 生成配置文件...${NC}"
+    mkdir -p "$CONFIG_DIR"
+    
+    cat > "$CONFIG_DIR/config.example.sh" << 'CONFIGEOF'
+#!/bin/bash
+# ech-workers 配置示例
+# 修改以下参数后保存为 config.sh
+
+# 监听地址 (0.0.0.0 允许所有网络接口)
+LISTEN_ADDR="0.0.0.0:30000"
+
+# Cloudflare Worker 地址
+WORKER_URL="your-worker.workers.dev:443"
+
+# 身份验证令牌
+TOKEN="your_token_here"
+
+# 高级选项 (可选)
+# FALLBACK_PROXY="backup.proxy.com:8080"
+# TARGET_IP="104.16.132.229"
+# DNS_SERVER="1.1.1.1/dns-query"
+# ECH_DOMAIN="cloudflare-ech.com"
+
+# 生成运行命令
+CMD="/usr/local/bin/ech-workers \\
+  -l \"\$LISTEN_ADDR\" \\
+  -f \"\$WORKER_URL\" \\
+  -token \"\$TOKEN\""
+
+# 添加可选参数
+[[ -n "\$FALLBACK_PROXY" ]] && CMD="\$CMD -pyip \"\$FALLBACK_PROXY\""
+[[ -n "\$TARGET_IP" ]] && CMD="\$CMD -ip \"\$TARGET_IP\""
+[[ -n "\$DNS_SERVER" ]] && CMD="\$CMD -dns \"\$DNS_SERVER\""
+[[ -n "\$ECH_DOMAIN" ]] && CMD="\$CMD -ech \"\$ECH_DOMAIN\""
+
+echo "运行命令:"
+echo \$CMD
+CONFIGEOF
+    
+    chmod +x "$CONFIG_DIR/config.example.sh"
+    echo -e "${GREEN}✓ 配置文件生成: $CONFIG_DIR/config.example.sh${NC}"
+fi
+
+# 创建 systemd 服务
+if [[ $CREATE_SERVICE -eq 1 ]]; then
+    echo -e "\n${YELLOW}创建 systemd 服务...${NC}"
+    
+    cat > "$SERVICE_FILE" << SERVICEEOF
+[Unit]
+Description=ech-workers Proxy Service (Ubuntu ARMv7)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/tmp
+ExecStart=$INSTALL_DIR/ech-workers \\
+    -l 0.0.0.0:30000 \\
+    -f your-worker.workers.dev:443 \\
+    -token YOUR_TOKEN_HERE \\
+    -pyip backup.proxy.com:8080 \\
+    -ip 104.16.132.229
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ech-workers
+
+# 安全设置
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+# 资源限制
+LimitNOFILE=65536
+MemoryLimit=256M
+CPUQuota=80%
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+    
+    # 重新加载 systemd
+    systemctl daemon-reload
+    systemctl enable ech-workers
+    
+    echo -e "${GREEN}✓ systemd 服务已创建并启用${NC}"
+    echo ""
+    echo "服务管理命令:"
+    echo "  启动: systemctl start ech-workers"
+    echo "  停止: systemctl stop ech-workers"
+    echo "  重启: systemctl restart ech-workers"
+    echo "  状态: systemctl status ech-workers"
+    echo "  日志: journalctl -u ech-workers -f"
+fi
+
+echo -e "\n${GREEN}==========================================${NC}"
+echo -e "${GREEN}   ech-workers 安装成功！${NC}"
+echo -e "${GREEN}==========================================${NC}"
+echo ""
+echo "使用说明:"
+echo "  1. 编辑配置参数"
+echo "  2. 运行: $INSTALL_DIR/ech-workers [参数]"
+echo "  3. 查看帮助: $INSTALL_DIR/ech-workers --help"
+echo ""
+echo "示例命令:"
+echo "  $INSTALL_DIR/ech-workers \\"
+echo "    -l 0.0.0.0:30000 \\"
+echo "    -f your-worker.workers.dev:443 \\"
+echo "    -token your_token \\"
+echo "    -pyip backup.proxy.com:8080"
+echo ""
+echo "测试代理:"
+echo "  curl --proxy http://127.0.0.1:30000 https://api.ipify.org"
+EOF
+        
+        chmod +x release/install-ubuntu-armv7.sh
+        
+        # 创建快速开始指南
+        cat > release/QUICKSTART.md << 'EOF'
+# ech-workers Ubuntu ARMv7 快速开始指南
+
+## 1. 下载最新版本
+
+```bash
+# 从 GitHub Actions 下载最新构建
+# 访问: https://github.com/YOUR_USERNAME/YOUR_REPO/actions
+# 下载最新构建的 artifacts
+
+# 或直接使用 wget（如果有下载链接）
+wget https://github.com/YOUR_USERNAME/YOUR_REPO/releases/latest/download/ech-workers-ubuntu-armv7.tar.gz
+tar -xzf ech-workers-ubuntu-armv7.tar.gz
+cd ech-workers-ubuntu-armv7
