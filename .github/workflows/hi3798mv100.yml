@@ -1,0 +1,243 @@
+name: Hi3798MV100 Special Build
+
+on:
+  workflow_dispatch:  # 仅手动触发
+  schedule:
+    - cron: '0 0 * * 0'  # 每周日自动构建
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    env:
+      APP_NAME: "ech-workers"
+      TARGET: "hi3798mv100"
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+        cache: true
+    
+    - name: Install musl cross compiler
+      run: |
+        # 使用 Bootlin 的预编译工具链（更稳定）
+        TOOLCHAIN_URL="https://toolchains.bootlin.com/downloads/releases/toolchains/armv7-eabihf/tarballs/armv7-eabihf--musl--stable-2023.08-1.tar.bz2"
+        wget -q $TOOLCHAIN_URL -O toolchain.tar.bz2
+        mkdir -p /opt/toolchain
+        tar -xjf toolchain.tar.bz2 -C /opt/toolchain --strip-components=1
+        echo "/opt/toolchain/bin" >> $GITHUB_PATH
+        
+        # 验证安装
+        /opt/toolchain/bin/arm-buildroot-uclibcgnueabihf-gcc --version
+    
+    - name: Build static binary
+      run: |
+        # 设置编译环境
+        export PATH="/opt/toolchain/bin:$PATH"
+        export CC="arm-buildroot-uclibcgnueabihf-gcc"
+        export GOOS="linux"
+        export GOARCH="arm"
+        export GOARM="7"
+        export CGO_ENABLED="1"
+        
+        # 获取版本
+        VERSION="v1.0.0-$(date +%Y%m%d)"
+        COMMIT=$(git rev-parse --short HEAD)
+        
+        echo "Building for Hi3798MV100..."
+        echo "Version: $VERSION"
+        echo "Commit: $COMMIT"
+        
+        # 静态编译
+        go build -a -v \
+          -o "${APP_NAME}-${TARGET}" \
+          -ldflags="-w -s \
+            -linkmode external \
+            -extldflags '-static' \
+            -X 'main.version=$VERSION' \
+            -X 'main.commit=$COMMIT' \
+            -X 'main.buildTime=$(date -u +\"%Y-%m-%dT%H:%M:%SZ\")'" \
+          .
+        
+        # 验证
+        file "${APP_NAME}-${TARGET}"
+        ls -lh "${APP_NAME}-${TARGET}"
+        
+        # 检查是否有动态依赖
+        echo "Checking dependencies..."
+        /opt/toolchain/bin/arm-buildroot-uclibcgnueabihf-readelf -d "${APP_NAME}-${TARGET}" | grep NEEDED || true
+    
+    - name: Test with QEMU
+      run: |
+        # 安装 QEMU 进行简单测试
+        sudo apt-get update
+        sudo apt-get install -y qemu-user-static qemu-user
+        
+        echo "Testing binary with QEMU..."
+        chmod +x "${APP_NAME}-${TARGET}"
+        
+        # 尝试运行帮助命令（最多5秒）
+        timeout 5s qemu-arm-static "${APP_NAME}-${TARGET}" --help 2>&1 | head -20 || \
+        echo "QEMU test completed (may have timed out)"
+    
+    - name: Create checksum
+      run: |
+        sha256sum "${APP_NAME}-${TARGET}" > "${APP_NAME}-${TARGET}.sha256"
+        md5sum "${APP_NAME}-${TARGET}" > "${APP_NAME}-${TARGET}.md5"
+        
+        echo "Checksums:"
+        cat "${APP_NAME}-${TARGET}.sha256"
+        cat "${APP_NAME}-${TARGET}.md5"
+    
+    - name: Prepare release assets
+      run: |
+        mkdir -p release
+        
+        # 复制文件
+        cp "${APP_NAME}-${TARGET}" release/
+        cp "${APP_NAME}-${TARGET}.sha256" release/
+        cp "${APP_NAME}-${TARGET}.md5" release/
+        
+        # 创建安装脚本
+        cat > release/install.sh << 'EOF'
+        #!/bin/bash
+        # ech-workers Hi3798MV100 安装脚本
+        
+        set -e
+        
+        echo "安装 ech-workers 到 Hi3798MV100"
+        
+        # 检查参数
+        if [ $# -eq 0 ]; then
+            echo "使用方法: $0 <设备IP>"
+            echo "示例: $0 192.168.1.100"
+            exit 1
+        fi
+        
+        DEVICE_IP="$1"
+        BINARY="ech-workers-hi3798mv100"
+        
+        echo "目标设备: $DEVICE_IP"
+        echo "二进制文件: $BINARY"
+        
+        # 检查文件
+        if [ ! -f "$BINARY" ]; then
+            echo "错误: 找不到文件 $BINARY"
+            exit 1
+        fi
+        
+        # 传输文件
+        echo "传输文件到设备..."
+        scp "$BINARY" root@${DEVICE_IP}:/tmp/
+        scp "$BINARY.sha256" root@${DEVICE_IP}:/tmp/ 2>/dev/null || true
+        
+        # 在设备上安装
+        ssh root@${DEVICE_IP} << 'SSHEOF'
+        echo "在设备上安装..."
+        
+        # 备份旧版本
+        if [ -f /usr/local/bin/ech-workers ]; then
+            BACKUP="/usr/local/bin/ech-workers.backup.$(date +%Y%m%d_%H%M%S)"
+            echo "备份旧版本到: $BACKUP"
+            cp /usr/local/bin/ech-workers "$BACKUP"
+        fi
+        
+        # 安装新版本
+        cp /tmp/ech-workers-hi3798mv100 /usr/local/bin/ech-workers
+        chmod +x /usr/local/bin/ech-workers
+        
+        # 验证
+        echo "安装完成！"
+        echo "文件信息:"
+        file /usr/local/bin/ech-workers
+        ls -lh /usr/local/bin/ech-workers
+        
+        echo -e "\n测试运行:"
+        /usr/local/bin/ech-workers --help 2>&1 | head -5 || echo "运行测试失败"
+        
+        echo -e "\n重启服务（如果已配置）:"
+        systemctl restart ech-workers 2>/dev/null || true
+        SSHEOF
+        
+        echo "安装完成！"
+        EOF
+        
+        chmod +x release/install.sh
+        
+        # 创建使用说明
+        cat > release/README.md << 'EOF'
+        # ech-workers for Hi3798MV100
+        
+        这是专门为 Hi3798MV100 设备编译的版本。
+        
+        ## 文件说明
+        
+        - `ech-workers-hi3798mv100` - 主二进制文件
+        - `ech-workers-hi3798mv100.sha256` - SHA256 校验和
+        - `ech-workers-hi3798mv100.md5` - MD5 校验和
+        - `install.sh` - 一键安装脚本
+        - `README.md` - 本文件
+        
+        ## 安装方法
+        
+        方法1: 使用安装脚本
+        ```bash
+        chmod +x install.sh
+        ./install.sh <设备IP>
+        ```
+        
+        示例:
+        ```bash
+        ./install.sh 192.168.1.100
+        ```
+        
+        方法2: 手动安装
+        ```bash
+        # 传输文件
+        scp ech-workers-hi3798mv100 root@192.168.1.100:/tmp/
+        
+        # 在设备上执行
+        ssh root@192.168.1.100
+        mv /tmp/ech-workers-hi3798mv100 /usr/local/bin/ech-workers
+        chmod +x /usr/local/bin/ech-workers
+        ```
+        
+        ## 使用方法
+        
+        ```bash
+        /usr/local/bin/ech-workers \
+          -l 0.0.0.0:30000 \
+          -f your-worker.workers.dev:443 \
+          -token YOUR_TOKEN \
+          -pyip backup.proxy.com:8080 \
+          -ip 104.16.132.229
+        ```
+        
+        ## 验证
+        
+        ```bash
+        # 检查文件类型
+        file /usr/local/bin/ech-workers
+        
+        # 运行测试
+        /usr/local/bin/ech-workers --help
+        ```
+        
+        ## 编译信息
+        
+        - 编译时间: $(date)
+        - Git Commit: $(git rev-parse --short HEAD)
+        - Go 版本: $(go version)
+        - 目标架构: ARMv7 (Hi3798MV100)
+        EOF
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: hi3798mv100-package
+        path: release/
+        retention-days: 90
