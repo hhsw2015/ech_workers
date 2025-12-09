@@ -18,7 +18,7 @@ After=network.target
 [Service]
 Type=simple
 User=root
-# 使用阿里 DNS 避免查询失败
+# 🤣🤣🤣🤣
 ExecStart=/usr/local/bin/ech-workers \
   -l 0.0.0.0:30000 \
   -f "xxxxxxxxxxx.workers.dev:443" \
