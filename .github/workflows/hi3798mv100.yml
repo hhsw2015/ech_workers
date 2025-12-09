@@ -31,8 +31,8 @@ jobs:
         #export PATH="$PWD/arm-linux-musleabihf-cross/bin:$PATH"
         
         # 验证
-        echo "验证工具链..."
-        arm-linux-musleabihf-gcc --version
+        #echo "验证工具链..."
+        #arm-linux-musleabihf-gcc --version
         
         # 方法2: 使用 apt 安装（备用）
         echo "方法2: 安装备用工具链"
