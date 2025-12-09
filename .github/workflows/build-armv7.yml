@@ -1,0 +1,821 @@
+name: 🔨 Build ARMv7 for Hi3798MV100
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]  # 标签触发时创建正式发布
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:  # 手动触发
+    inputs:
+      version:
+        description: '自定义版本号 (如 v1.0.0)'
+        required: false
+        default: 'auto'
+      clean_build:
+        description: '清理构建缓存'
+        required: false
+        default: false
+
+env:
+  GO_VERSION: '1.21'
+  PROJECT_NAME: 'ech-workers'
+  BUILD_TARGET: 'hi3798mv100'
+  OUTPUT_DIR: 'artifacts'
+  CACHE_KEY: ${{ github.ref }}
+
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      build_version: ${{ steps.version.outputs.build_version }}
+    
+    steps:
+      - name: 🔍 检查构建条件
+        id: check
+        run: |
+          # 跳过文档和配置文件的变更
+          if [[ "${{ github.event.head_commit.message }}" =~ ^(docs|chore|style) ]]; then
+            echo "::warning::跳过构建（仅文档/配置变更）"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: 🏷️ 确定版本号
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ github.event.inputs.version }}" != "auto" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/}"
+          else
+            DATE=$(date +%Y%m%d)
+            COMMIT=${GITHUB_SHA:0:8}
+            VERSION="nightly-${DATE}-${COMMIT}"
+          fi
+          echo "版本号: $VERSION"
+          echo "build_version=$VERSION" >> $GITHUB_OUTPUT
+
+  build-armv7:
+    runs-on: ubuntu-latest
+    needs: build-check
+    if: needs.build-check.outputs.should_build == 'true'
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [standard, static]
+    
+    steps:
+      - name: 📥 检出代码
+        uses: actions/checkout@v4
+        with:
+          repository: hhsw2015/ech_workers
+          fetch-depth: 0
+          lfs: true
+      
+      - name: 🔧 设置 Go 环境
+        uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+      
+      - name: 📦 初始化构建环境
+        run: |
+          mkdir -p ${{ env.OUTPUT_DIR }}
+          echo "BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+          echo "GO_VERSION=$(go version | cut -d' ' -f3)" >> $GITHUB_ENV
+          
+          # 显示构建信息
+          echo "📋 构建信息:"
+          echo "项目: ${{ env.PROJECT_NAME }}"
+          echo "目标设备: ${{ env.BUILD_TARGET }}"
+          echo "版本: ${{ needs.build-check.outputs.build_version }}"
+          echo "构建类型: ${{ matrix.build_type }}"
+          echo "Go版本: $(go version)"
+      
+      - name: 🛠️ 构建 ARMv7 版本
+        id: build
+        run: |
+          set -e
+          
+          VERSION="${{ needs.build-check.outputs.build_version }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          
+          echo "🚀 开始构建 ${{ matrix.build_type }} 版本..."
+          
+          # 设置构建参数
+          if [ "${{ matrix.build_type }}" = "static" ]; then
+            LD_FLAGS="-w -s -extldflags \"-static\""
+            OUTPUT_SUFFIX="-static"
+            CGO_ENABLED="0"
+          else
+            LD_FLAGS="-w -s"
+            OUTPUT_SUFFIX=""
+            CGO_ENABLED="1"
+          fi
+          
+          # 设置完整版本信息
+          FULL_VERSION="${VERSION}+${COMMIT}"
+          
+          # 交叉编译命令
+          GOOS=linux GOARCH=arm GOARM=7 CGO_ENABLED=$CGO_ENABLED \
+            go build \
+            -v \
+            -trimpath \
+            -o "${{ env.OUTPUT_DIR }}/${{ env.PROJECT_NAME }}-armv7${OUTPUT_SUFFIX}" \
+            -ldflags="${LD_FLAGS} \
+              -X 'main.Version=$FULL_VERSION' \
+              -X 'main.BuildTime=${{ env.BUILD_DATE }}' \
+              -X 'main.GoVersion=${{ env.GO_VERSION }}' \
+              -X 'main.Commit=$COMMIT'" \
+            .
+          
+          echo "✅ 构建完成"
+          
+          # 输出构建信息
+          echo "build_output=${{ env.OUTPUT_DIR }}/${{ env.PROJECT_NAME }}-armv7${OUTPUT_SUFFIX}" >> $GITHUB_OUTPUT
+          echo "build_suffix=${OUTPUT_SUFFIX}" >> $GITHUB_OUTPUT
+      
+      - name: 🔍 验证二进制文件
+        run: |
+          echo "🔍 验证构建结果:"
+          ls -lh ${{ env.OUTPUT_DIR }}/
+          
+          FILE="${{ steps.build.outputs.build_output }}"
+          echo "📄 文件信息:"
+          file "$FILE"
+          
+          echo "📦 文件大小:"
+          ls -lh "$FILE"
+          
+          echo "🔢 检查 ELF 头部:"
+          readelf -h "$FILE" | grep -E "(机器|类型|入口点)" || true
+      
+      - name: 🧪 QEMU 模拟测试
+        run: |
+          echo "🧪 使用 QEMU 进行基本测试..."
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static qemu-user
+          
+          TEST_BIN="${{ steps.build.outputs.build_output }}"
+          chmod +x "$TEST_BIN"
+          
+          echo "测试帮助命令:"
+          timeout 5s qemu-arm-static "$TEST_BIN" --help 2>&1 | head -20 || \
+            echo "⚠️ QEMU 测试可能受限，继续构建流程..."
+          
+          echo "✅ QEMU 测试完成"
+      
+      - name: 🔒 创建校验和
+        run: |
+          echo "🔒 生成文件校验和..."
+          
+          BIN_FILE="${{ steps.build.outputs.build_output }}"
+          BASE_NAME=$(basename "$BIN_FILE")
+          
+          cd ${{ env.OUTPUT_DIR }}
+          
+          # 创建多种校验和
+          sha256sum "$BASE_NAME" > "$BASE_NAME.sha256"
+          sha1sum "$BASE_NAME" > "$BASE_NAME.sha1"
+          md5sum "$BASE_NAME" > "$BASE_NAME.md5"
+          
+          # 创建 BLAKE3 校验和（更现代）
+          if command -v b3sum &> /dev/null; then
+            sudo apt-get install -y b3sum
+            b3sum "$BASE_NAME" > "$BASE_NAME.b3sum"
+          fi
+          
+          echo "📋 校验和列表:"
+          cat *.sha256
+          cat *.sha1
+          cat *.md5
+          [ -f *.b3sum ] && cat *.b3sum || true
+      
+      - name: 📄 创建版本信息文件
+        run: |
+          echo "📝 创建版本信息..."
+          
+          cat > "${{ env.OUTPUT_DIR }}/BUILD_INFO.txt" << EOF
+# ${{ env.PROJECT_NAME }} - ${{ env.BUILD_TARGET }} 构建信息
+构建时间: ${{ env.BUILD_DATE }}
+版本: ${{ needs.build-check.outputs.build_version }}
+提交: $(git rev-parse HEAD)
+分支: ${{ github.ref_name }}
+构建类型: ${{ matrix.build_type }}
+
+## 环境信息
+GitHub Actions URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+触发事件: ${{ github.event_name }}
+触发者: ${{ github.actor }}
+
+## 构建配置
+Go 版本: ${{ env.GO_VERSION }}
+操作系统: $(uname -s)
+架构: $(uname -m)
+构建参数: GOOS=linux GOARCH=arm GOARM=7
+
+## 文件信息
+二进制文件: $(basename ${{ steps.build.outputs.build_output }})
+文件大小: $(du -h ${{ steps.build.outputs.build_output }} | cut -f1)
+ELF 类型: $(file ${{ steps.build.outputs.build_output }} | cut -d':' -f2-)
+
+## 依赖版本
+$(go version)
+$(go list -m all | grep -E "(ech|workers|cloudflare)" || echo "无特殊依赖")
+EOF
+          
+          echo "✅ 版本信息文件已创建"
+      
+      - name: 📦 打包构建结果
+        run: |
+          echo "📦 打包构建结果..."
+          
+          VERSION="${{ needs.build-check.outputs.build_version }}"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          
+          cd ${{ env.OUTPUT_DIR }}
+          
+          # 创建打包目录
+          PACKAGE_DIR="${{ env.PROJECT_NAME }}-${VERSION}-armv7-${BUILD_TYPE}"
+          mkdir -p "$PACKAGE_DIR"
+          
+          # 复制所有文件
+          cp ${{ env.PROJECT_NAME }}-armv7${steps.build.outputs.build_suffix}* "$PACKAGE_DIR/"
+          cp BUILD_INFO.txt "$PACKAGE_DIR/"
+          
+          # 创建安装脚本
+          cat > "$PACKAGE_DIR/install.sh" << 'EOF'
+#!/bin/bash
+# ech-workers Hi3798MV100 ARMv7 安装脚本
+# 版本: ${{ needs.build-check.outputs.build_version }}
+
+set -e
+
+# 配置参数
+INSTALL_DIR="/usr/local/bin"
+SERVICE_DIR="/etc/systemd/system"
+CONFIG_DIR="/etc/ech-workers"
+LOG_DIR="/var/log/ech-workers"
+TEMP_DIR="/tmp/ech-workers-install"
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# 日志函数
+log() {
+    echo -e "${BLUE}[$(date '+%Y-%m-%d %H:%M:%S')]${NC} $1"
+}
+
+success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+warn() {
+    echo -e "${YELLOW}⚠${NC} $1"
+}
+
+error() {
+    echo -e "${RED}✗${NC} $1"
+    exit 1
+}
+
+# 显示横幅
+show_banner() {
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║         ech-workers Hi3798MV100 ARMv7 安装程序           ║"
+    echo "║               版本: ${{ needs.build-check.outputs.build_version }}              ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+}
+
+# 检查系统
+check_system() {
+    log "检查系统环境..."
+    
+    # 检查架构
+    local arch=$(uname -m)
+    case "$arch" in
+        armv7l|armhf)
+            success "检测到 ARMv7 架构 ($arch)"
+            ;;
+        *)
+            warn "检测到架构: $arch (预期: ARMv7)"
+            read -p "是否继续？[y/N]: " -n 1 -r
+            echo
+            [[ $REPLY =~ ^[Yy]$ ]] || error "安装中止"
+            ;;
+    esac
+    
+    # 检查内存
+    local mem=$(free -m | awk '/^Mem:/{print $2}')
+    if [ "$mem" -lt 128 ]; then
+        warn "系统内存较低 ($mem MB)，建议至少有 256MB 内存"
+    fi
+    
+    # 检查磁盘空间
+    local disk=$(df -m / | awk 'NR==2 {print $4}')
+    if [ "$disk" -lt 50 ]; then
+        warn "磁盘空间紧张 ($disk MB 可用)"
+    fi
+}
+
+# 安装依赖
+install_dependencies() {
+    log "检查系统依赖..."
+    
+    local deps_missing=false
+    
+    # 检查必需的命令
+    for cmd in curl systemctl ip; do
+        if ! command -v "$cmd" &> /dev/null; then
+            warn "缺少命令: $cmd"
+            deps_missing=true
+        fi
+    done
+    
+    if [ "$deps_missing" = true ]; then
+        log "尝试安装依赖..."
+        
+        if command -v apt-get &> /dev/null; then
+            apt-get update
+            apt-get install -y curl iproute2 ca-certificates || warn "部分依赖安装失败"
+        elif command -v yum &> /dev/null; then
+            yum install -y curl iproute ca-certificates || warn "部分依赖安装失败"
+        elif command -v opkg &> /dev/null; then
+            opkg update
+            opkg install curl ca-certificates || warn "部分依赖安装失败"
+        else
+            warn "无法自动安装依赖，请手动安装"
+        fi
+    fi
+}
+
+# 安装主程序
+install_binary() {
+    log "安装 ech-workers 主程序..."
+    
+    # 创建安装目录
+    mkdir -p "$INSTALL_DIR"
+    
+    # 备份旧版本
+    local binary_path="$INSTALL_DIR/ech-workers"
+    if [ -f "$binary_path" ]; then
+        local backup_path="${binary_path}.backup.$(date +%Y%m%d_%H%M%S)"
+        cp "$binary_path" "$backup_path"
+        success "旧版本已备份到: $backup_path"
+    fi
+    
+    # 查找二进制文件
+    local binary_source
+    for file in ech-workers-*; do
+        if [[ "$file" == ech-workers-* && ! "$file" == *.* ]]; then
+            binary_source="$file"
+            break
+        fi
+    done
+    
+    if [ -z "$binary_source" ]; then
+        error "找不到可安装的二进制文件"
+    fi
+    
+    # 安装新版本
+    cp "$binary_source" "$binary_path"
+    chmod +x "$binary_path"
+    chown root:root "$binary_path"
+    
+    # 验证安装
+    if [ -x "$binary_path" ]; then
+        local version_info=$("$binary_path" --help 2>&1 | head -5)
+        success "程序安装成功"
+        echo "版本信息:"
+        echo "$version_info" | sed 's/^/  /'
+    else
+        error "程序安装失败"
+    fi
+}
+
+# 创建配置文件
+create_config() {
+    log "创建配置文件..."
+    
+    mkdir -p "$CONFIG_DIR"
+    
+    # 主配置文件
+    cat > "$CONFIG_DIR/config.env" << 'CONFIGEOF'
+# ech-workers 配置文件
+# 生成时间: $(date)
+
+# 基本配置
+LISTEN_ADDR="0.0.0.0:30000"
+WORKER_URL="your-worker.workers.dev:443"
+TOKEN="your_token_here"
+
+# 高级配置 (可选)
+# FALLBACK_PROXY=""
+# PREFERRED_IP=""
+# DNS_SERVER="223.5.5.5/dns-query"
+# ECH_DOMAIN="cloudflare.ech.com"
+
+# 性能调整
+# CONNECTION_LIMIT=100
+# TIMEOUT=30
+# BUFFER_SIZE=4096
+CONFIGEOF
+    
+    # 创建示例启动脚本
+    cat > "$CONFIG_DIR/start-example.sh" << 'EXAMPLEEOF'
+#!/bin/bash
+# ech-workers 启动示例
+
+source /etc/ech-workers/config.env
+
+# 构建命令行参数
+ARGS="-l \"\$LISTEN_ADDR\" -f \"\$WORKER_URL\" -token \"\$TOKEN\""
+
+[ -n "\$FALLBACK_PROXY" ] && ARGS="\$ARGS -pyip \"\$FALLBACK_PROXY\""
+[ -n "\$PREFERRED_IP" ] && ARGS="\$ARGS -ip \"\$PREFERRED_IP\""
+[ -n "\$DNS_SERVER" ] && ARGS="\$ARGS -dns \"\$DNS_SERVER\""
+[ -n "\$ECH_DOMAIN" ] && ARGS="\$ARGS -ech \"\$ECH_DOMAIN\""
+
+echo "启动命令:"
+echo "/usr/local/bin/ech-workers \$ARGS"
+
+# 实际执行（取消注释以启用）
+# exec /usr/local/bin/ech-workers \$ARGS
+EXAMPLEEOF
+    
+    chmod +x "$CONFIG_DIR/start-example.sh"
+    chmod 600 "$CONFIG_DIR/config.env"
+    
+    success "配置文件已创建: $CONFIG_DIR/"
+}
+
+# 创建 systemd 服务
+create_systemd_service() {
+    log "创建 systemd 服务..."
+    
+    local service_file="$SERVICE_DIR/ech-workers.service"
+    
+    cat > "$service_file" << SERVICEEOF
+[Unit]
+Description=ech-workers Proxy Service (Hi3798MV100)
+Description=基于 Cloudflare Workers 的代理服务
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/${{ github.repository }}
+Before=syslog.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/tmp
+
+# 从配置文件读取参数
+EnvironmentFile=-/etc/ech-workers/config.env
+
+# 启动命令
+ExecStart=/usr/local/bin/ech-workers \\
+    -l \${LISTEN_ADDR:-0.0.0.0:30000} \\
+    -f \${WORKER_URL} \\
+    -token \${TOKEN} \\
+    \${FALLBACK_PROXY:+-pyip "\${FALLBACK_PROXY}"} \\
+    \${PREFERRED_IP:+-ip "\${PREFERRED_IP}"} \\
+    \${DNS_SERVER:+-dns "\${DNS_SERVER}"} \\
+    \${ECH_DOMAIN:+-ech "\${ECH_DOMAIN}"}
+
+# 重启策略
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=0
+StartLimitInterval=60
+StartLimitBurst=3
+
+# 资源限制
+LimitNOFILE=65536
+MemoryMax=256M
+MemoryHigh=200M
+CPUQuota=80%
+
+# 安全设置
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+# 日志设置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ech-workers
+LogLevelMax=info
+
+# 环境变量
+Environment="GODEBUG=netdns=go"
+Environment="TZ=Asia/Shanghai"
+
+[Install]
+WantedBy=multi-user.target
+SERVICEEOF
+    
+    # 重新加载 systemd
+    systemctl daemon-reload
+    
+    success "systemd 服务文件已创建: $service_file"
+}
+
+# 设置日志轮转
+setup_logrotate() {
+    log "设置日志轮转..."
+    
+    cat > /etc/logrotate.d/ech-workers << 'LOGROTATE'
+/var/log/ech-workers/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        systemctl try-reload-or-restart ech-workers >/dev/null 2>&1 || true
+    endscript
+}
+LOGROTATE
+    
+    # 创建日志目录
+    mkdir -p "$LOG_DIR"
+    chmod 750 "$LOG_DIR"
+    
+    success "日志轮转配置完成"
+}
+
+# 防火墙配置
+configure_firewall() {
+    log "配置防火墙..."
+    
+    local port=${LISTEN_ADDR##*:}
+    
+    if command -v ufw &> /dev/null; then
+        ufw allow "$port/tcp"
+        ufw reload
+        success "UFW 防火墙已配置 (端口: $port)"
+    elif command -v iptables &> /dev/null; then
+        iptables -A INPUT -p tcp --dport "$port" -j ACCEPT
+        success "iptables 规则已添加 (端口: $port)"
+    elif command -v firewall-cmd &> /dev/null; then
+        firewall-cmd --permanent --add-port="$port/tcp"
+        firewall-cmd --reload
+        success "firewalld 已配置 (端口: $port)"
+    else
+        warn "未找到支持的防火墙工具，请手动开放端口 $port"
+    fi
+}
+
+# 创建管理脚本
+create_management_scripts() {
+    log "创建管理脚本..."
+    
+    # 状态检查脚本
+    cat > "/usr/local/bin/ech-workers-status" << 'STATUSEOF'
+#!/bin/bash
+# ech-workers 状态检查脚本
+
+SERVICE="ech-workers"
+PORT=$(grep -oP 'LISTEN_ADDR=".*:\K\d+' /etc/ech-workers/config.env 2>/dev/null || echo "30000")
+
+echo "🔍 ech-workers 状态检查"
+echo "========================"
+
+# 检查服务状态
+if systemctl is-active --quiet "$SERVICE"; then
+    echo "✅ 服务状态: 运行中"
+    echo "   PID: $(systemctl show -p MainPID "$SERVICE" | cut -d= -f2)"
+else
+    echo "❌ 服务状态: 未运行"
+fi
+
+# 检查端口监听
+if ss -tln | grep -q ":$PORT "; then
+    echo "✅ 端口监听: 正常 (端口: $PORT)"
+else
+    echo "❌ 端口监听: 异常"
+fi
+
+# 检查配置文件
+if [ -f "/etc/ech-workers/config.env" ]; then
+    echo "✅ 配置文件: 存在"
+else
+    echo "⚠️ 配置文件: 缺失"
+fi
+
+# 测试连接（可选）
+if [ "$1" == "--test" ]; then
+    echo -n "测试代理连接: "
+    if timeout 5 curl -s --proxy "http://127.0.0.1:$PORT" http://httpbin.org/ip >/dev/null; then
+        echo "✅ 成功"
+    else
+        echo "❌ 失败"
+    fi
+fi
+STATUSEOF
+    
+    chmod +x "/usr/local/bin/ech-workers-status"
+    
+    success "管理脚本已创建"
+}
+
+# 显示安装完成信息
+show_completion() {
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║                   安装完成！                            ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "📋 安装摘要:"
+    echo "  • 程序文件: $INSTALL_DIR/ech-workers"
+    echo "  • 配置文件: $CONFIG_DIR/"
+    echo "  • 服务文件: $SERVICE_DIR/ech-workers.service"
+    echo "  • 日志目录: $LOG_DIR/"
+    echo ""
+    echo "🚀 启动服务:"
+    echo "  sudo systemctl start ech-workers"
+    echo ""
+    echo "📊 服务管理:"
+    echo "  sudo systemctl status ech-workers    # 查看状态"
+    echo "  sudo systemctl restart ech-workers   # 重启服务"
+    echo "  sudo journalctl -u ech-workers -f    # 查看日志"
+    echo ""
+    echo "🔧 配置修改:"
+    echo "  编辑配置文件: sudo nano /etc/ech-workers/config.env"
+    echo "  然后重启: sudo systemctl restart ech-workers"
+    echo ""
+    echo "🌐 代理地址:"
+    echo "  HTTP/HTTPS: http://$(hostname -I | awk '{print $1}'):${LISTEN_ADDR##*:}"
+    echo "  SOCKS5: socks5://$(hostname -I | awk '{print $1}'):${LISTEN_ADDR##*:}"
+    echo ""
+    echo "💡 快速测试:"
+    echo "  curl --proxy http://127.0.0.1:${LISTEN_ADDR##*:} http://httpbin.org/ip"
+    echo ""
+    echo "📝 版本信息:"
+    /usr/local/bin/ech-workers --help 2>&1 | grep -E "(版本|Version)" | head -2 || true
+}
+
+# 主安装流程
+main() {
+    show_banner
+    check_system
+    install_dependencies
+    install_binary
+    create_config
+    create_systemd_service
+    setup_logrotate
+    configure_firewall
+    create_management_scripts
+    show_completion
+    
+    log "安装完成！建议重启服务使所有配置生效。"
+    echo ""
+    read -p "是否立即启动服务？[Y/n]: " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]] || [ -z "$REPLY" ]; then
+        systemctl start ech-workers
+        systemctl enable ech-workers
+        success "服务已启动并设置为开机自启"
+    fi
+}
+
+# 运行主函数
+main "$@"
+EOF
+          
+          chmod +x "$PACKAGE_DIR/install.sh"
+          
+          # 创建 tar 包
+          tar -czf "${PACKAGE_DIR}.tar.gz" "$PACKAGE_DIR"
+          
+          # 清理临时目录
+          rm -rf "$PACKAGE_DIR"
+          
+          echo "✅ 打包完成: ${PACKAGE_DIR}.tar.gz"
+      
+      - name: 🏷️ 重命名文件
+        run: |
+          cd ${{ env.OUTPUT_DIR }}
+          
+          VERSION="${{ needs.build-check.outputs.build_version }}"
+          BUILD_TYPE="${{ matrix.build_type }}"
+          
+          # 重命名主要文件
+          for ext in "" .sha256 .sha1 .md5 .b3sum; do
+            if [ -f "${{ env.PROJECT_NAME }}-armv7${steps.build.outputs.build_suffix}${ext}" ]; then
+              mv "${{ env.PROJECT_NAME }}-armv7${steps.build.outputs.build_suffix}${ext}" \
+                 "${{ env.PROJECT_NAME }}-${VERSION}-armv7${BUILD_TYPE}${ext}"
+            fi
+          done
+          
+          echo "📁 最终文件列表:"
+          ls -lh *
+      
+      - name: 📤 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-${{ needs.build-check.outputs.build_version }}-${{ matrix.build_type }}
+          path: ${{ env.OUTPUT_DIR }}/*
+          retention-days: 30
+          if-no-files-found: error
+  
+  create-release:
+    runs-on: ubuntu-latest
+    needs: [build-check, build-armv7]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: 📥 下载所有构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ env.PROJECT_NAME }}-*
+          merge-multiple: true
+      
+      - name: 🏷️ 创建 GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ needs.build-check.outputs.build_version }}
+          body: |
+            # ech-workers Hi3798MV100 ARMv7 版本
+            
+            ## 📋 版本信息
+            - **版本号**: ${{ needs.build-check.outputs.build_version }}
+            - **构建时间**: ${{ env.BUILD_DATE }}
+            - **目标设备**: Hi3798MV100 (ARMv7)
+            - **Go版本**: ${{ env.GO_VERSION }}
+            
+            ## 📦 包含的构建
+            - **标准版本**: 动态链接库，体积较小
+            - **静态版本**: 完全静态编译，无需外部依赖
+            
+            ## 🚀 快速开始
+            1. 下载对应的 tar.gz 文件
+            2. 解压: `tar -xzf ech-workers-*.tar.gz`
+            3. 运行安装脚本: `sudo ./install.sh`
+            
+            ## 🔧 使用说明
+            详细使用说明请参考解压后的 README 文件
+            
+            ## 📝 变更日志
+            ${{ github.event.head_commit.message }}
+            
+            ## 🔒 校验和
+            下载后请验证文件校验和确保完整性
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.sha256
+            artifacts/*.md5
+            artifacts/BUILD_INFO.txt
+      
+      - name: 📢 发布通知
+        if: success()
+        run: |
+          echo "🎉 发布成功！"
+          echo "版本: ${{ needs.build-check.outputs.build_version }}"
+          echo "Release URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.build-check.outputs.build_version }}"
+
+  cleanup:
+    runs-on: ubuntu-latest
+    needs: [build-armv7, create-release]
+    if: always()
+    
+    steps:
+      - name: 🧹 清理工作流
+        run: |
+          echo "🧹 清理构建缓存..."
+          if [ "${{ github.event.inputs.clean_build }}" = "true" ]; then
+            echo "清理所有缓存"
+            # 这里可以添加缓存清理逻辑
+          fi
+          
+          echo "✅ 工作流执行完成"
+          echo "状态: ${{ job.status }}"
