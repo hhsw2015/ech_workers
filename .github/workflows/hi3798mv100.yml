@@ -25,10 +25,10 @@ jobs:
         echo "安装交叉编译工具链..."
         
         # 方法1: 使用 musl.cc（最简单）
-        echo "方法1: 使用 musl.cc 工具链"
-        wget -q https://musl.cc/arm-linux-musleabihf-cross.tgz
-        tar -xzf arm-linux-musleabihf-cross.tgz
-        export PATH="$PWD/arm-linux-musleabihf-cross/bin:$PATH"
+        #echo "方法1: 使用 musl.cc 工具链"
+        #wget -q https://musl.cc/arm-linux-musleabihf-cross.tgz
+        #tar -xzf arm-linux-musleabihf-cross.tgz
+        #export PATH="$PWD/arm-linux-musleabihf-cross/bin:$PATH"
         
         # 验证
         echo "验证工具链..."
