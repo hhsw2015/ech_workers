@@ -10,7 +10,6 @@ import json
 import os
 import subprocess
 import threading
-import urllib.request
 import ipaddress
 from pathlib import Path
 
@@ -26,15 +25,29 @@ if sys.platform == 'win32':
     except:
         pass
     
-    # 高 DPI 支持
+    # 高 DPI 支持 - 必须在导入 PyQt5 之前设置
+    # 使用 PROCESS_PER_MONITOR_DPI_AWARE_V2 (Windows 10 1703+)
+    # 这支持每个监视器 DPI 感知，并启用子窗口 DPI 缩放
     try:
-        from ctypes import windll
-        windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
-    except:
+        from ctypes import windll, ctypes
+        # 尝试使用最新的 DPI 感知 API (Windows 10 1703+)
         try:
-            windll.user32.SetProcessDPIAware()
-        except:
-            pass
+            # PROCESS_PER_MONITOR_DPI_AWARE_V2 = 2
+            # 这个值支持每个监视器 DPI 感知和子窗口 DPI 缩放
+            windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            # 如果 shcore 不可用，尝试旧版 API
+            try:
+                # PROCESS_PER_MONITOR_DPI_AWARE = 2 (旧版)
+                windll.shcore.SetProcessDpiAwareness(2)
+            except:
+                # 如果都失败，使用最基础的 DPI 感知
+                try:
+                    windll.user32.SetProcessDPIAware()
+                except:
+                    pass
+    except:
+        pass
 
 # 检查 PyQt5
 try:
@@ -42,26 +55,56 @@ try:
                                   QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                                   QComboBox, QTextEdit, QCheckBox, QGroupBox, 
                                   QMessageBox, QInputDialog, QSystemTrayIcon, QMenu, QAction)
-    from PyQt5.QtCore import Qt, QThread, pyqtSignal
-    from PyQt5.QtGui import QIcon
+    from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize
+    from PyQt5.QtGui import QIcon, QTextCursor, QPixmap, QPainter, QColor, QFont
     HAS_PYQT = True
     
+    # 注册 QTextCursor 类型以避免信号槽错误
+    try:
+        from PyQt5.QtCore import qRegisterMetaType
+        qRegisterMetaType('QTextCursor')
+    except (ImportError, AttributeError):
+        # qRegisterMetaType 在某些 PyQt5 版本中可能不可用，忽略
+        pass
+    
     # 高 DPI 支持 - 必须在创建 QApplication 之前设置
+    # PyQt5 5.6+ 支持高 DPI 缩放
     if hasattr(Qt, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, 'AA_UseHighDpiPixmaps'):
         QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+    
+    # 设置环境变量以优化高 DPI 显示（Windows）
+    if sys.platform == 'win32':
+        try:
+            # 启用高 DPI 缩放
+            os.environ['QT_ENABLE_HIGHDPI_SCALING'] = '1'
+            # 设置缩放因子舍入策略（避免模糊）
+            os.environ['QT_SCALE_FACTOR_ROUNDING_POLICY'] = 'Round'
+            # 禁用自动缩放因子（让系统处理）
+            # os.environ['QT_AUTO_SCREEN_SCALE_FACTOR'] = '0'
+        except:
+            pass
 except ImportError:
     HAS_PYQT = False
     print("错误: 未安装 PyQt5")
     print("安装命令: pip3 install PyQt5")
     sys.exit(1)
 
-APP_VERSION = "1.2"
-APP_TITLE = f"ECH WK 客户端 v{APP_VERSION}"
+APP_VERSION = "1.4"
+APP_TITLE = f"ECH Workers 客户端 v{APP_VERSION}"
 
-# 中国IP列表URL
-CHINA_IP_LIST_URL = "https://raw.githubusercontent.com/mayaxcn/china-ip-list/master/chn_ip.txt"
+# 中国IP列表文件名（离线版本，放在程序目录）
+CHINA_IP_LIST_FILE = "chn_ip.txt"
+
+def get_app_dir():
+    """获取程序所在目录（支持打包后的可执行文件）"""
+    if getattr(sys, 'frozen', False):
+        # PyInstaller 打包后的可执行文件
+        return Path(sys.executable).parent.absolute()
+    else:
+        # 开发模式或直接运行 Python 脚本
+        return Path(__file__).parent.absolute()
 
 # 复用原有的 ConfigManager, ProcessManager, AutoStartManager
 # 从原文件导入这些类（简化版本）
@@ -176,11 +219,11 @@ class ProcessThread(QThread):
         """运行进程"""
         exe_path = self._find_executable()
         if not exe_path:
-            script_dir = Path(__file__).parent.absolute()
+            app_dir = get_app_dir()
             self.log_output.emit("错误: 找不到 ech-workers 可执行文件!\n")
             self.log_output.emit(f"请确保 ech-workers 可执行文件在以下位置之一:\n")
-            self.log_output.emit(f"  - {script_dir}/ech-workers\n")
-            self.log_output.emit(f"  - {script_dir}/ech-workers.exe\n")
+            self.log_output.emit(f"  - {app_dir}/ech-workers\n")
+            self.log_output.emit(f"  - {app_dir}/ech-workers.exe\n")
             self.log_output.emit(f"  - {Path.cwd()}/ech-workers\n")
             self.log_output.emit(f"  - 或者在系统 PATH 中\n")
             self.log_output.emit(f"\n注意: ech-workers 必须是编译后的可执行文件，不是源文件。\n")
@@ -200,6 +243,10 @@ class ProcessThread(QThread):
             cmd.extend(['-dns', self.config['dns']])
         if self.config.get('ech') and self.config['ech'] != 'cloudflare-ech.com':
             cmd.extend(['-ech', self.config['ech']])
+        # 添加分流模式参数
+        routing_mode = self.config.get('routing_mode', 'bypass_cn')
+        if routing_mode:
+            cmd.extend(['-routing', routing_mode])
         
         try:
             # Windows 上需要指定 UTF-8 编码，因为 Go 程序输出 UTF-8
@@ -254,8 +301,8 @@ class ProcessThread(QThread):
     
     def _find_executable(self):
         """查找可执行文件（跨平台）"""
-        # 脚本所在目录
-        script_dir = Path(__file__).parent.absolute()
+        # 程序所在目录（支持双击运行）
+        app_dir = get_app_dir()
         # 当前工作目录
         current_dir = Path.cwd()
         
@@ -264,13 +311,13 @@ class ProcessThread(QThread):
         
         # 可能的可执行文件路径（按优先级）
         possible_paths = [
-            script_dir / f'ech-workers{exe_ext}',
+            app_dir / f'ech-workers{exe_ext}',
             current_dir / f'ech-workers{exe_ext}',
             # Windows 特定路径
-            script_dir / 'ech-workers.exe' if sys.platform == 'win32' else None,
+            app_dir / 'ech-workers.exe' if sys.platform == 'win32' else None,
             current_dir / 'ech-workers.exe' if sys.platform == 'win32' else None,
             # Unix 路径（无扩展名）
-            script_dir / 'ech-workers' if sys.platform != 'win32' else None,
+            app_dir / 'ech-workers' if sys.platform != 'win32' else None,
             current_dir / 'ech-workers' if sys.platform != 'win32' else None,
         ]
         
@@ -342,8 +389,8 @@ class MainWindow(QMainWindow):
         self.load_server_config()
         self.init_tray_icon()  # 初始化系统托盘
         
-        # 异步加载中国IP列表
-        self.load_china_ip_list_async()
+        # 异步加载中国IP列表（静默模式：失败时不显示错误）
+        self.load_china_ip_list_async(silent=True)
         
         if self.is_autostart:
             self.hide()
@@ -353,32 +400,110 @@ class MainWindow(QMainWindow):
     def init_ui(self):
         """初始化界面"""
         self.setWindowTitle(APP_TITLE)
-        self.setGeometry(100, 100, 900, 750)
+        
+        # Windows DPI 适配：根据系统 DPI 调整窗口大小
+        # PyQt5 的 AA_EnableHighDpiScaling 会自动处理缩放
+        # 我们设置逻辑像素大小，系统会自动转换为物理像素
+        base_width = 950
+        base_height = 800
+        
+        # 获取可用屏幕区域（排除任务栏）
+        try:
+            # 方法1: 使用 QApplication.desktop() (PyQt5 推荐方式)
+            try:
+                desktop = QApplication.desktop()
+                available_geometry = desktop.availableGeometry()
+                screen_width = available_geometry.width()
+                screen_height = available_geometry.height()
+                screen_x = available_geometry.x()
+                screen_y = available_geometry.y()
+            except:
+                # 方法2: 使用 QScreen (如果 desktop() 不可用)
+                try:
+                    screen = QApplication.primaryScreen()
+                    available_geometry = screen.availableGeometry()
+                    screen_width = available_geometry.width()
+                    screen_height = available_geometry.height()
+                    screen_x = available_geometry.x()
+                    screen_y = available_geometry.y()
+                except:
+                    # 如果都失败，使用默认值
+                    screen_width = 1920
+                    screen_height = 1080
+                    screen_x = 0
+                    screen_y = 0
+            
+            # 确保窗口大小不超过可用区域
+            if base_width > screen_width:
+                base_width = screen_width - 40  # 留出边距
+            if base_height > screen_height:
+                base_height = screen_height - 40  # 留出边距，确保不遮挡任务栏
+            
+            # 计算居中位置
+            x = screen_x + (screen_width - base_width) // 2
+            y = screen_y + (screen_height - base_height) // 2
+            
+            # 确保窗口不会超出屏幕边界
+            if x < screen_x:
+                x = screen_x + 20
+            if y < screen_y:
+                y = screen_y + 20
+            
+            self.setGeometry(x, y, base_width, base_height)
+        except:
+            # 如果获取屏幕信息失败，使用默认位置
+            self.setGeometry(100, 100, base_width, base_height)
+        
+        # 设置窗口图标（黑客帝国风格）
+        self.setWindowIcon(self._create_matrix_icon())
+        
+        # 应用现代化样式
+        self.setStyleSheet(self._get_modern_style())
         
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
         
         # 服务器管理
         server_group = QGroupBox("服务器管理")
         server_layout = QHBoxLayout()
-        server_layout.addWidget(QLabel("选择服务器:"))
+        server_layout.setSpacing(10)
+        server_label = QLabel("选择服务器:")
+        server_label.setStyleSheet("font-weight: 600;")
+        server_layout.addWidget(server_label)
         self.server_combo = QComboBox()
         self.server_combo.currentIndexChanged.connect(self.on_server_changed)
-        server_layout.addWidget(self.server_combo)
-        server_layout.addWidget(QPushButton("新增", clicked=self.add_server))
-        server_layout.addWidget(QPushButton("保存", clicked=self.save_server))
-        server_layout.addWidget(QPushButton("重命名", clicked=self.rename_server))
-        server_layout.addWidget(QPushButton("删除", clicked=self.delete_server))
+        server_layout.addWidget(self.server_combo, 1)
+        
+        # 按钮组
+        btn_new = QPushButton("新增")
+        btn_new.clicked.connect(self.add_server)
+        btn_save = QPushButton("保存")
+        btn_save.clicked.connect(self.save_server)
+        btn_rename = QPushButton("重命名")
+        btn_rename.clicked.connect(self.rename_server)
+        btn_delete = QPushButton("删除")
+        btn_delete.clicked.connect(self.delete_server)
+        
+        server_layout.addWidget(btn_new)
+        server_layout.addWidget(btn_save)
+        server_layout.addWidget(btn_rename)
+        server_layout.addWidget(btn_delete)
+        server_layout.addStretch()
         server_group.setLayout(server_layout)
         layout.addWidget(server_group)
         
         # 核心配置
         core_group = QGroupBox("核心配置")
         core_layout = QVBoxLayout()
+        core_layout.setSpacing(12)
         self.server_edit = QLineEdit()
+        self.server_edit.setPlaceholderText("例如: your-worker.workers.dev:443")
         core_layout.addWidget(self.create_label_edit("服务地址:", self.server_edit))
         self.listen_edit = QLineEdit()
+        self.listen_edit.setPlaceholderText("例如: 127.0.0.1:30000")
         core_layout.addWidget(self.create_label_edit("监听地址:", self.listen_edit))
         core_group.setLayout(core_layout)
         layout.addWidget(core_group)
@@ -386,15 +511,22 @@ class MainWindow(QMainWindow):
         # 高级选项
         advanced_group = QGroupBox("高级选项 (可选)")
         advanced_layout = QVBoxLayout()
+        advanced_layout.setSpacing(12)
         self.token_edit = QLineEdit()
+        self.token_edit.setPlaceholderText("身份验证令牌（可选）")
+        self.token_edit.setEchoMode(QLineEdit.Password)
         advanced_layout.addWidget(self.create_label_edit("身份令牌:", self.token_edit))
         row1 = QHBoxLayout()
+        row1.setSpacing(10)
         self.ip_edit = QLineEdit()
+        self.ip_edit.setPlaceholderText("例如: saas.sin.fan")
         row1.addWidget(self.create_label_edit("优选IP或域名:", self.ip_edit))
         self.dns_edit = QLineEdit()
+        self.dns_edit.setPlaceholderText("例如: dns.alidns.com/dns-query")
         row1.addWidget(self.create_label_edit("DOH服务器:", self.dns_edit))
         advanced_layout.addLayout(row1)
         self.ech_edit = QLineEdit()
+        self.ech_edit.setPlaceholderText("例如: cloudflare-ech.com")
         advanced_layout.addWidget(self.create_label_edit("ECH域名:", self.ech_edit))
         advanced_group.setLayout(advanced_layout)
         layout.addWidget(advanced_group)
@@ -402,13 +534,16 @@ class MainWindow(QMainWindow):
         # 分流设置
         routing_group = QGroupBox("分流设置")
         routing_layout = QHBoxLayout()
-        routing_layout.addWidget(QLabel("代理模式:"))
+        routing_layout.setSpacing(10)
+        routing_label = QLabel("代理模式:")
+        routing_label.setStyleSheet("font-weight: 600;")
+        routing_layout.addWidget(routing_label)
         self.routing_combo = QComboBox()
         self.routing_combo.addItem("全局代理", "global")
-        self.routing_combo.addItem("跳过中国大陆", "bypass_cn")
+        self.routing_combo.addItem("🇨🇳 跳过中国大陆", "bypass_cn")
         self.routing_combo.addItem("不改变代理", "none")
         self.routing_combo.currentIndexChanged.connect(self.on_routing_changed)
-        routing_layout.addWidget(self.routing_combo)
+        routing_layout.addWidget(self.routing_combo, 1)
         routing_layout.addStretch()
         routing_group.setLayout(routing_layout)
         layout.addWidget(routing_group)
@@ -416,6 +551,7 @@ class MainWindow(QMainWindow):
         # 控制按钮
         control_group = QGroupBox("控制")
         control_layout = QHBoxLayout()
+        control_layout.setSpacing(10)
         self.start_btn = QPushButton("启动代理")
         self.start_btn.clicked.connect(self.start_process)
         self.stop_btn = QPushButton("停止")
@@ -431,7 +567,9 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.proxy_btn)
         control_layout.addWidget(self.auto_start_check)
         control_layout.addStretch()
-        control_layout.addWidget(QPushButton("清空日志", clicked=self.clear_log))
+        btn_clear = QPushButton("清空日志")
+        btn_clear.clicked.connect(self.clear_log)
+        control_layout.addWidget(btn_clear)
         control_group.setLayout(control_layout)
         layout.addWidget(control_group)
         
@@ -443,10 +581,346 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout()
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setFont(QApplication.font())
+        # 使用等宽字体，更适合日志显示
+        from PyQt5.QtGui import QFont
+        font = QFont("Consolas" if sys.platform == 'win32' else "Monaco" if sys.platform == 'darwin' else "DejaVu Sans Mono", 9)
+        self.log_text.setFont(font)
         log_layout.addWidget(self.log_text)
         log_group.setLayout(log_layout)
         layout.addWidget(log_group)
+    
+    def _create_matrix_icon(self):
+        """创建黑客帝国风格图标"""
+        # 创建不同尺寸的图标
+        sizes = [16, 32, 48, 64, 128, 256]
+        icon = QIcon()
+        
+        for size in sizes:
+            pixmap = QPixmap(size, size)
+            pixmap.fill(QColor(0, 0, 0))  # 黑色背景
+            
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.Antialiasing)
+            
+            # 绘制绿色边框
+            painter.setPen(QColor(0, 255, 65))  # 矩阵绿
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(2, 2, size - 4, size - 4)
+            
+            # 绘制内部装饰（矩阵代码风格）
+            if size >= 32:
+                # 绘制一些绿色线条和点，模拟矩阵代码
+                painter.setPen(QColor(0, 255, 65))
+                
+                # 绘制对角线
+                if size >= 48:
+                    painter.drawLine(4, 4, size - 4, size - 4)
+                    painter.drawLine(size - 4, 4, 4, size - 4)
+                
+                # 绘制中心点
+                center = size // 2
+                painter.setBrush(QColor(0, 255, 65))
+                painter.drawEllipse(center - 2, center - 2, 4, 4)
+                
+                # 绘制一些装饰线条
+                if size >= 64:
+                    # 绘制四个角的装饰
+                    corner_size = size // 4
+                    painter.setPen(QColor(0, 200, 50))  # 稍暗的绿色
+                    # 左上角
+                    painter.drawLine(4, 4, corner_size, 4)
+                    painter.drawLine(4, 4, 4, corner_size)
+                    # 右上角
+                    painter.drawLine(size - 4, 4, size - corner_size, 4)
+                    painter.drawLine(size - 4, 4, size - 4, corner_size)
+                    # 左下角
+                    painter.drawLine(4, size - 4, corner_size, size - 4)
+                    painter.drawLine(4, size - 4, 4, size - corner_size)
+                    # 右下角
+                    painter.drawLine(size - 4, size - 4, size - corner_size, size - 4)
+                    painter.drawLine(size - 4, size - 4, size - 4, size - corner_size)
+            
+            painter.end()
+            icon.addPixmap(pixmap)
+        
+        return icon
+    
+    def _get_modern_style(self):
+        """获取黑客帝国风格样式表"""
+        return """
+        /* 主窗口样式 - 深色背景 */
+        QMainWindow {
+            background-color: #000000;
+        }
+        
+        /* 分组框样式 - 矩阵绿色边框 */
+        QGroupBox {
+            font-weight: 600;
+            font-size: 13px;
+            color: #00ff41;
+            border: 2px solid #00ff41;
+            border-radius: 8px;
+            margin-top: 12px;
+            padding-top: 15px;
+            padding-bottom: 15px;
+            background-color: #0a0a0a;
+        }
+        
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top left;
+            left: 15px;
+            padding: 0 8px;
+            background-color: #000000;
+            color: #00ff41;
+        }
+        
+        /* 标签样式 - 绿色文字 */
+        QLabel {
+            color: #00ff41;
+            font-size: 13px;
+            min-width: 100px;
+        }
+        
+        /* 输入框样式 - 深色背景，绿色边框 */
+        QLineEdit {
+            border: 2px solid #003311;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 13px;
+            background-color: #0a0a0a;
+            color: #00ff41;
+            selection-background-color: #00ff41;
+            selection-color: #000000;
+        }
+        
+        QLineEdit:focus {
+            border: 2px solid #00ff41;
+            background-color: #001a0a;
+        }
+        
+        QLineEdit:disabled {
+            background-color: #050505;
+            color: #006622;
+            border: 2px solid #002211;
+        }
+        
+        /* 下拉框样式 */
+        QComboBox {
+            border: 2px solid #003311;
+            border-radius: 6px;
+            padding: 8px 12px;
+            font-size: 13px;
+            background-color: #0a0a0a;
+            color: #00ff41;
+            min-width: 150px;
+        }
+        
+        QComboBox:hover {
+            border: 2px solid #00ff41;
+        }
+        
+        QComboBox:focus {
+            border: 2px solid #00ff41;
+            background-color: #001a0a;
+        }
+        
+        QComboBox:disabled {
+            background-color: #050505;
+            color: #006622;
+            border: 2px solid #002211;
+        }
+        
+        QComboBox::drop-down {
+            border: none;
+            width: 30px;
+            border-top-right-radius: 6px;
+            border-bottom-right-radius: 6px;
+            background-color: transparent;
+        }
+        
+        QComboBox::down-arrow {
+            image: none;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #00ff41;
+            width: 0;
+            height: 0;
+        }
+        
+        QComboBox QAbstractItemView {
+            border: 2px solid #00ff41;
+            border-radius: 6px;
+            background-color: #0a0a0a;
+            selection-background-color: #00ff41;
+            selection-color: #000000;
+            padding: 4px;
+            color: #00ff41;
+        }
+        
+        /* 按钮样式 - 绿色主题 */
+        QPushButton {
+            background-color: #003311;
+            color: #00ff41;
+            border: 2px solid #00ff41;
+            border-radius: 6px;
+            padding: 10px 20px;
+            font-size: 13px;
+            font-weight: 600;
+            min-width: 100px;
+        }
+        
+        QPushButton:hover {
+            background-color: #00ff41;
+            color: #000000;
+            border: 2px solid #00ff41;
+        }
+        
+        QPushButton:pressed {
+            background-color: #00cc33;
+            color: #000000;
+        }
+        
+        QPushButton:disabled {
+            background-color: #001a0a;
+            color: #006622;
+            border: 2px solid #003311;
+        }
+        
+        /* 停止按钮特殊样式 - 红色警告 */
+        QPushButton[text="停止"] {
+            background-color: #330000;
+            color: #ff0044;
+            border: 2px solid #ff0044;
+        }
+        
+        QPushButton[text="停止"]:hover {
+            background-color: #ff0044;
+            color: #000000;
+        }
+        
+        QPushButton[text="停止"]:pressed {
+            background-color: #cc0033;
+            color: #000000;
+        }
+        
+        /* 清空日志按钮样式 */
+        QPushButton[text="清空日志"] {
+            background-color: #1a1a1a;
+            color: #888888;
+            border: 2px solid #444444;
+        }
+        
+        QPushButton[text="清空日志"]:hover {
+            background-color: #444444;
+            color: #00ff41;
+            border: 2px solid #00ff41;
+        }
+        
+        /* 复选框样式 */
+        QCheckBox {
+            color: #00ff41;
+            font-size: 13px;
+            spacing: 8px;
+        }
+        
+        QCheckBox::indicator {
+            width: 20px;
+            height: 20px;
+            border: 2px solid #00ff41;
+            border-radius: 4px;
+            background-color: #0a0a0a;
+        }
+        
+        QCheckBox::indicator:hover {
+            background-color: #001a0a;
+        }
+        
+        QCheckBox::indicator:checked {
+            background-color: #00ff41;
+            border: 2px solid #00ff41;
+            image: none;
+        }
+        
+        QCheckBox::indicator:checked::after {
+            content: "✓";
+            color: #000000;
+            font-size: 14px;
+            font-weight: bold;
+        }
+        
+        /* 文本编辑框样式（日志） - 矩阵风格 */
+        QTextEdit {
+            border: 2px solid #00ff41;
+            border-radius: 6px;
+            padding: 12px;
+            font-size: 12px;
+            background-color: #000000;
+            color: #00ff41;
+            selection-background-color: #00ff41;
+            selection-color: #000000;
+        }
+        
+        QTextEdit:focus {
+            border: 2px solid #00ff41;
+        }
+        
+        /* 滚动条样式 - 绿色主题 */
+        QScrollBar:vertical {
+            border: none;
+            background-color: #0a0a0a;
+            width: 12px;
+            margin: 0;
+        }
+        
+        QScrollBar::handle:vertical {
+            background-color: #003311;
+            border: 1px solid #00ff41;
+            border-radius: 6px;
+            min-height: 20px;
+            margin: 2px;
+        }
+        
+        QScrollBar::handle:vertical:hover {
+            background-color: #00ff41;
+        }
+        
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+            height: 0;
+        }
+        
+        QScrollBar:horizontal {
+            border: none;
+            background-color: #0a0a0a;
+            height: 12px;
+            margin: 0;
+        }
+        
+        QScrollBar::handle:horizontal {
+            background-color: #003311;
+            border: 1px solid #00ff41;
+            border-radius: 6px;
+            min-width: 20px;
+            margin: 2px;
+        }
+        
+        QScrollBar::handle:horizontal:hover {
+            background-color: #00ff41;
+        }
+        
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+            width: 0;
+        }
+        
+        /* 布局间距 */
+        QVBoxLayout {
+            spacing: 10px;
+        }
+        
+        QHBoxLayout {
+            spacing: 10px;
+        }
+        """
     
     def init_tray_icon(self):
         """初始化系统托盘图标"""
@@ -456,17 +930,19 @@ class MainWindow(QMainWindow):
         # 创建系统托盘图标
         self.tray_icon = QSystemTrayIcon(self)
         
-        # 尝试创建简单的图标（如果没有图标文件，使用默认图标）
+        # 使用黑客帝国风格图标
         try:
-            # 创建一个简单的图标
-            icon = QIcon()
-            # 使用应用程序图标或创建一个简单的图标
-            if hasattr(QApplication, 'style'):
-                icon = self.style().standardIcon(self.style().SP_ComputerIcon)
+            icon = self._create_matrix_icon()
             self.tray_icon.setIcon(icon)
         except:
             # 如果创建图标失败，使用默认图标
-            pass
+            try:
+                icon = QIcon()
+                if hasattr(QApplication, 'style'):
+                    icon = self.style().standardIcon(self.style().SP_ComputerIcon)
+                self.tray_icon.setIcon(icon)
+            except:
+                pass
         
         self.tray_icon.setToolTip(APP_TITLE)
         
@@ -526,42 +1002,56 @@ class MainWindow(QMainWindow):
         
         QApplication.quit()
     
-    def load_china_ip_list_async(self):
-        """异步加载中国IP列表"""
+    def load_china_ip_list_async(self, silent=False):
+        """异步加载中国IP列表（从离线文件读取）
+        
+        Args:
+            silent: 是否静默模式（失败时不显示错误）
+        """
         def load_in_thread():
             try:
-                self.append_log("[系统] 正在加载中国IP列表...\n")
+                if not silent:
+                    self.append_log("[系统] 正在加载中国IP列表（离线版本）...\n")
                 ranges = self._load_china_ip_list()
                 if ranges:
                     self.china_ip_ranges = ranges
-                    self.append_log(f"[系统] 已加载中国IP列表，共 {len(ranges)} 个IP段\n")
-                else:
-                    self.append_log("[系统] 加载中国IP列表失败，使用默认列表\n")
+                    if not silent:
+                        self.append_log(f"[系统] 已加载中国IP列表，共 {len(ranges)} 个IP段\n")
+                # 失败时不显示错误（静默模式）
             except Exception as e:
-                self.append_log(f"[系统] 加载中国IP列表出错: {e}\n")
+                # 静默模式：不显示错误
+                if not silent:
+                    self.append_log(f"[系统] 加载中国IP列表出错: {e}\n")
         
         thread = threading.Thread(target=load_in_thread, daemon=True)
         thread.start()
     
     def _load_china_ip_list(self):
-        """下载并解析中国IP列表"""
+        """从程序目录读取并解析中国IP列表（离线版本）"""
         try:
-            # 尝试从缓存读取
+            # 尝试从缓存读取（永久有效，不检查过期时间）
             cache_file = self.config_manager.config_dir / "china_ip_list.json"
             if cache_file.exists():
                 try:
                     with open(cache_file, 'r', encoding='utf-8') as f:
                         cached_data = json.load(f)
-                        # 检查缓存是否过期（24小时）
-                        import time
-                        if time.time() - cached_data.get('timestamp', 0) < 86400:
-                            return cached_data.get('ranges', [])
+                        ranges = cached_data.get('ranges', [])
+                        if ranges:
+                            return ranges
                 except:
                     pass
             
-            # 下载IP列表
-            with urllib.request.urlopen(CHINA_IP_LIST_URL, timeout=10) as response:
-                content = response.read().decode('utf-8')
+            # 从程序目录读取IP列表文件（离线版本）
+            app_dir = get_app_dir()
+            ip_list_file = app_dir / CHINA_IP_LIST_FILE
+            
+            if not ip_list_file.exists():
+                # 如果文件不存在，返回 None（静默失败）
+                return None
+            
+            # 读取文件内容
+            with open(ip_list_file, 'r', encoding='utf-8') as f:
+                content = f.read()
             
             # 解析IP范围
             ranges = []
@@ -581,7 +1071,7 @@ class MainWindow(QMainWindow):
                     except:
                         continue
             
-            # 保存到缓存
+            # 保存到缓存（永久有效）
             try:
                 import time
                 with open(cache_file, 'w', encoding='utf-8') as f:
@@ -594,7 +1084,7 @@ class MainWindow(QMainWindow):
             
             return ranges
         except Exception as e:
-            print(f"加载中国IP列表失败: {e}")
+            # 静默失败，不打印错误
             return None
     
     def _convert_ip_ranges_to_wildcards(self, ranges):
@@ -665,8 +1155,13 @@ class MainWindow(QMainWindow):
         """创建标签和输入框"""
         widget = QWidget()
         layout = QHBoxLayout(widget)
-        layout.addWidget(QLabel(label_text))
-        layout.addWidget(edit_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        label = QLabel(label_text)
+        label.setMinimumWidth(120)
+        label.setStyleSheet("font-weight: 500;")
+        layout.addWidget(label)
+        layout.addWidget(edit_widget, 1)
         return widget
     
     def init_server_combo(self):
@@ -761,7 +1256,15 @@ class MainWindow(QMainWindow):
     def get_control_values(self):
         """获取界面输入值"""
         server = self.config_manager.get_current_server()
-        if server:
+        if not server:
+            # 如果没有当前服务器，创建一个临时配置
+            import uuid
+            server = {
+                'id': str(uuid.uuid4()),
+                'name': '临时配置',
+            }
+        
+        # 创建副本并更新为界面当前值
             server = server.copy()
             server['server'] = self.server_edit.text()
             server['listen'] = self.listen_edit.text()
@@ -769,10 +1272,13 @@ class MainWindow(QMainWindow):
             server['ip'] = self.ip_edit.text()
             server['dns'] = self.dns_edit.text()
             server['ech'] = self.ech_edit.text()
-            # 保存分流模式
-            routing_mode = self.routing_combo.currentData()
-            if routing_mode:
-                server['routing_mode'] = routing_mode
+        # 保存分流模式
+        routing_mode = self.routing_combo.currentData()
+        if routing_mode:
+            server['routing_mode'] = routing_mode
+        else:
+            # 如果没有选择，使用默认值
+            server['routing_mode'] = server.get('routing_mode', 'bypass_cn')
         return server
     
     def on_server_changed(self):
@@ -794,11 +1300,30 @@ class MainWindow(QMainWindow):
         if index >= 0:
             server_id = self.server_combo.itemData(index)
             if server_id and server_id != self.config_manager.current_server_id:
+                # 先保存当前编辑框的值到当前服务器（如果有的话）
+                current_server = self.config_manager.get_current_server()
+                if current_server:
+                    # 将当前编辑框的值保存到当前服务器
+                    current_server['server'] = self.server_edit.text()
+                    current_server['listen'] = self.listen_edit.text()
+                    current_server['token'] = self.token_edit.text()
+                    current_server['ip'] = self.ip_edit.text()
+                    current_server['dns'] = self.dns_edit.text()
+                    current_server['ech'] = self.ech_edit.text()
+                    # 保存分流模式
+                    routing_mode = self.routing_combo.currentData()
+                    if routing_mode:
+                        current_server['routing_mode'] = routing_mode
+                    self.config_manager.update_server(current_server)
+                
+                # 切换到新服务器
                 self.config_manager.current_server_id = server_id
                 # 暂时断开信号，避免递归
                 self.server_combo.currentIndexChanged.disconnect()
+                # 加载新服务器的配置到界面
                 self.load_server_config()
                 self.server_combo.currentIndexChanged.connect(self.on_server_changed)
+                # 保存配置
                 self.config_manager.save_config()
     
     def add_server(self):
@@ -914,6 +1439,10 @@ class MainWindow(QMainWindow):
         self.listen_edit.setEnabled(False)
         self.server_combo.setEnabled(False)
         self.append_log(f"[系统] 已启动服务器: {server['name']}\n")
+        
+        # 如果中国IP列表未加载，尝试加载（从离线文件）
+        if self.china_ip_ranges is None:
+            self.load_china_ip_list_async(silent=True)
     
     def stop_process(self):
         """停止进程"""
@@ -958,11 +1487,16 @@ class MainWindow(QMainWindow):
                 app_name = "ECHWorkersClient"
                 
                 if enabled:
-                    # 获取当前脚本路径
-                    script_path = Path(__file__).absolute()
-                    python_path = sys.executable
-                    # 创建启动命令
-                    cmd = f'"{python_path}" "{script_path}"'
+                    # 获取程序路径（支持打包后的可执行文件）
+                    app_path = get_app_dir() / "gui.py"
+                    if not app_path.exists() and getattr(sys, 'frozen', False):
+                        # 如果是打包后的可执行文件，直接使用可执行文件路径
+                        app_path = Path(sys.executable)
+                        cmd = f'"{app_path}"'
+                    else:
+                        # 开发模式：使用 Python 运行脚本
+                        python_path = sys.executable
+                        cmd = f'"{python_path}" "{app_path}"'
                     
                     try:
                         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path, 0, winreg.KEY_SET_VALUE)
@@ -990,9 +1524,32 @@ class MainWindow(QMainWindow):
                     # macOS
                     plist_path = Path.home() / "Library" / "LaunchAgents" / "com.echworkers.client.plist"
                     if enabled:
-                        script_path = Path(__file__).absolute()
-                        python_path = sys.executable
-                        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+                        # 获取程序路径（支持打包后的可执行文件）
+                        app_path = get_app_dir() / "gui.py"
+                        if not app_path.exists() and getattr(sys, 'frozen', False):
+                            # 如果是打包后的可执行文件，直接使用可执行文件路径
+                            app_path = Path(sys.executable)
+                            plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.echworkers.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{app_path}</string>
+        <string>-autostart</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"""
+                        else:
+                            # 开发模式：使用 Python 运行脚本
+                            python_path = sys.executable
+                            plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -1001,7 +1558,7 @@ class MainWindow(QMainWindow):
     <key>ProgramArguments</key>
     <array>
         <string>{python_path}</string>
-        <string>{script_path}</string>
+        <string>{app_path}</string>
         <string>-autostart</string>
     </array>
     <key>RunAtLoad</key>
@@ -1062,13 +1619,27 @@ class MainWindow(QMainWindow):
     def append_log(self, text):
         """追加日志"""
         self.log_text.append(text)
-        # 限制日志长度
+        # 限制日志长度（使用更安全的方式，避免 QTextCursor 信号问题）
         if self.log_text.document().blockCount() > 1000:
-            cursor = self.log_text.textCursor()
-            cursor.movePosition(cursor.Start)
-            cursor.movePosition(cursor.Down, cursor.MoveAnchor, 100)
-            cursor.movePosition(cursor.Start, cursor.KeepAnchor)
-            cursor.removeSelectedText()
+            try:
+                # 获取文档内容
+                doc = self.log_text.document()
+                # 删除前100行
+                cursor = QTextCursor(doc)
+                cursor.movePosition(QTextCursor.Start)
+                for _ in range(100):
+                    cursor.movePosition(QTextCursor.Down, QTextCursor.MoveAnchor)
+                cursor.movePosition(QTextCursor.Start, QTextCursor.KeepAnchor)
+                cursor.removeSelectedText()
+            except:
+                # 如果出错，直接清空并保留最后900行
+                try:
+                    content = self.log_text.toPlainText()
+                    lines = content.split('\n')
+                    if len(lines) > 900:
+                        self.log_text.setPlainText('\n'.join(lines[-900:]))
+                except:
+                    pass
     
     def update_auto_start_checkbox(self):
         """更新开机启动复选框状态"""
@@ -1121,6 +1692,7 @@ class MainWindow(QMainWindow):
             # 获取当前监听地址
             listen = self.listen_edit.text()
             if not listen and enabled:
+                self.append_log("[系统] 监听地址为空，无法设置系统代理\n")
                 return False
             
             # 获取分流模式
@@ -1134,6 +1706,9 @@ class MainWindow(QMainWindow):
                     self.append_log("[系统] 分流模式为\"不改变代理\"，跳过系统代理设置\n")
                 return True
             
+            # 注意：分流功能已在 Go 程序中实现，系统代理只需设置为全局代理
+            # Go 程序会根据 -routing 参数自动处理分流
+            
             if sys.platform == 'win32':
                 return self._set_windows_proxy(enabled, listen, routing_mode)
             elif sys.platform == 'darwin':
@@ -1143,56 +1718,17 @@ class MainWindow(QMainWindow):
                 return False
         except Exception as e:
             self.append_log(f"[系统] 设置系统代理失败: {e}\n")
+            import traceback
+            self.append_log(f"[系统] 错误详情: {traceback.format_exc()}\n")
             return False
     
     def _get_proxy_bypass_list(self, routing_mode):
-        """获取代理绕过列表"""
+        """获取代理绕过列表（分流已在 Go 程序中实现，这里只设置本地和内网绕过）"""
         # 基础绕过列表（本地和内网）
+        # 注意：分流功能已在 Go 程序中实现，系统代理设置为全局代理
+        # Go 程序会根据分流模式自动决定哪些流量走代理，哪些直连
         base_bypass = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>"
-        
-        if routing_mode == 'global':
-            # 全局代理：只绕过本地和内网
-            return base_bypass
-        elif routing_mode == 'bypass_cn':
-            # 跳过中国大陆：添加中国IP段和常见中国域名
-            cn_domains = [
-                "*.cn", "*.com.cn", "*.net.cn", "*.org.cn", "*.gov.cn", "*.edu.cn",
-                "*.baidu.com", "*.qq.com", "*.taobao.com", "*.tmall.com", "*.alipay.com",
-                "*.weibo.com", "*.sina.com", "*.163.com", "*.126.com", "*.sohu.com",
-                "*.youku.com", "*.iqiyi.com", "*.bilibili.com", "*.douyin.com", "*.douban.com",
-                "*.zhihu.com", "*.jd.com", "*.alibaba.com", "*.1688.com",
-                "*.tencent.com", "*.weixin.qq.com", "*.qzone.com"
-            ]
-            
-            # 使用下载的中国IP列表
-            cn_ip_wildcards = []
-            if self.china_ip_ranges:
-                cn_ip_wildcards = self._convert_ip_ranges_to_wildcards(self.china_ip_ranges)
-            else:
-                # 如果还没加载完成，使用默认的主要IP段
-                cn_ip_wildcards = [
-                    "1.*", "14.*", "27.*", "36.*", "39.*", "42.*", "49.*", "58.*", "59.*", "60.*",
-                    "61.*", "101.*", "103.*", "106.*", "110.*", "111.*", "112.*", "113.*", "114.*", "115.*",
-                    "116.*", "117.*", "118.*", "119.*", "120.*", "121.*", "122.*", "123.*", "124.*", "125.*",
-                    "171.*", "175.*", "180.*", "182.*", "183.*", "202.*", "203.*", "210.*", "211.*", "218.*",
-                    "219.*", "220.*", "221.*", "222.*", "223.*"
-                ]
-            
-            # Windows ProxyOverride 使用分号分隔，支持通配符
-            # 注意：Windows ProxyOverride 有长度限制（约2048字符），需要优化
-            cn_bypass_parts = cn_domains + cn_ip_wildcards
-            cn_bypass = ";".join(cn_bypass_parts)
-            
-            # 如果超过长度限制，只使用域名和主要IP段
-            MAX_LENGTH = 2000
-            if len(cn_bypass) > MAX_LENGTH:
-                # 只使用域名和A段通配符（格式：A.*）
-                a_segment_wildcards = [w for w in cn_ip_wildcards if w.count('.') == 1 and w.endswith('.*')]
-                cn_bypass = ";".join(cn_domains + a_segment_wildcards)
-            
-            return f"{base_bypass};{cn_bypass}"
-        else:
-            return base_bypass
+        return base_bypass
     
     def _set_windows_proxy(self, enabled, listen, routing_mode):
         """设置 Windows 系统代理"""
@@ -1215,7 +1751,9 @@ class MainWindow(QMainWindow):
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
                 # 根据分流模式设置绕过列表
                 bypass_list = self._get_proxy_bypass_list(routing_mode)
+                self.append_log(f"[系统] 设置绕过列表，长度: {len(bypass_list)} 字符\n")
                 winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, bypass_list)
+                self.append_log(f"[系统] Windows 代理已设置: {proxy_server}, 分流模式: {routing_mode}\n")
             else:
                 # 关闭代理
                 winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
@@ -1238,46 +1776,17 @@ class MainWindow(QMainWindow):
             return False
     
     def _get_macos_bypass_list(self, routing_mode):
-        """获取 macOS 代理绕过列表"""
+        """获取 macOS 代理绕过列表（分流已在 Go 程序中实现，这里只设置本地和内网绕过）"""
         # 基础绕过列表（本地和内网）
+        # 注意：分流功能已在 Go 程序中实现，系统代理设置为全局代理
+        # Go 程序会根据分流模式自动决定哪些流量走代理，哪些直连
         base_bypass = [
             "localhost", "127.*", "10.*", "172.16.*", "172.17.*", "172.18.*",
             "172.19.*", "172.20.*", "172.21.*", "172.22.*", "172.23.*", "172.24.*",
             "172.25.*", "172.26.*", "172.27.*", "172.28.*", "172.29.*", "172.30.*",
             "172.31.*", "192.168.*", "*.local", "169.254.*"
         ]
-        
-        if routing_mode == 'global':
-            # 全局代理：只绕过本地和内网
-            return base_bypass
-        elif routing_mode == 'bypass_cn':
-            # 跳过中国大陆：添加中国域名和IP
-            cn_domains = [
-                "*.cn", "*.com.cn", "*.net.cn", "*.org.cn", "*.gov.cn", "*.edu.cn",
-                "*.baidu.com", "*.qq.com", "*.taobao.com", "*.tmall.com", "*.alipay.com",
-                "*.weibo.com", "*.sina.com", "*.163.com", "*.126.com", "*.sohu.com",
-                "*.youku.com", "*.iqiyi.com", "*.bilibili.com", "*.douyin.com", "*.douban.com",
-                "*.zhihu.com", "*.jd.com", "*.alibaba.com", "*.1688.com",
-                "*.tencent.com", "*.weixin.qq.com", "*.qzone.com"
-            ]
-            
-            # 使用下载的中国IP列表（macOS也支持IP通配符）
-            cn_ip_wildcards = []
-            if self.china_ip_ranges:
-                cn_ip_wildcards = self._convert_ip_ranges_to_wildcards(self.china_ip_ranges)
-            else:
-                # 如果还没加载完成，使用默认的主要IP段
-                cn_ip_wildcards = [
-                    "1.*", "14.*", "27.*", "36.*", "39.*", "42.*", "49.*", "58.*", "59.*", "60.*",
-                    "61.*", "101.*", "103.*", "106.*", "110.*", "111.*", "112.*", "113.*", "114.*", "115.*",
-                    "116.*", "117.*", "118.*", "119.*", "120.*", "121.*", "122.*", "123.*", "124.*", "125.*",
-                    "171.*", "175.*", "180.*", "182.*", "183.*", "202.*", "203.*", "210.*", "211.*", "218.*",
-                    "219.*", "220.*", "221.*", "222.*", "223.*"
-                ]
-            
-            return base_bypass + cn_domains + cn_ip_wildcards
-        else:
-            return base_bypass
+        return base_bypass
     
     def _set_macos_proxy(self, enabled, listen, routing_mode):
         """设置 macOS 系统代理"""

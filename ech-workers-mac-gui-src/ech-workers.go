@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -27,16 +29,37 @@ import (
 // ======================== 全局参数 ========================
 
 var (
-	listenAddr string
-	serverAddr string
-	serverIP   string
-	token      string
-	dnsServer  string
-	echDomain  string
+	listenAddr  string
+	serverAddr  string
+	serverIP    string
+	token       string
+	dnsServer   string
+	echDomain   string
+	routingMode string // 分流模式: "global", "bypass_cn", "none"
 
 	echListMu sync.RWMutex
 	echList   []byte
+
+	// 中国IP列表（IPv4）
+	chinaIPRangesMu sync.RWMutex
+	chinaIPRanges   []ipRange
+
+	// 中国IP列表（IPv6）
+	chinaIPV6RangesMu sync.RWMutex
+	chinaIPV6Ranges   []ipRangeV6
 )
+
+// ipRange 表示一个IPv4 IP范围
+type ipRange struct {
+	start uint32
+	end   uint32
+}
+
+// ipRangeV6 表示一个IPv6 IP范围
+type ipRangeV6 struct {
+	start [16]byte
+	end   [16]byte
+}
 
 func init() {
 	flag.StringVar(&listenAddr, "l", "127.0.0.1:30000", "代理监听地址 (支持 SOCKS5 和 HTTP)")
@@ -45,6 +68,7 @@ func init() {
 	flag.StringVar(&token, "token", "", "身份验证令牌")
 	flag.StringVar(&dnsServer, "dns", "dns.alidns.com/dns-query", "ECH 查询 DoH 服务器")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "ECH 查询域名")
+	flag.StringVar(&routingMode, "routing", "global", "分流模式: global(全局代理), bypass_cn(跳过中国大陆), none(不改变代理)")
 }
 
 func main() {
@@ -59,10 +83,398 @@ func main() {
 		log.Fatalf("[启动] 获取 ECH 配置失败: %v", err)
 	}
 
+	// 加载中国IP列表（如果需要）
+	if routingMode == "bypass_cn" {
+		log.Printf("[启动] 分流模式: 跳过中国大陆，正在加载中国IP列表...")
+		ipv4Count := 0
+		ipv6Count := 0
+
+		if err := loadChinaIPList(); err != nil {
+			log.Printf("[警告] 加载中国IPv4列表失败: %v", err)
+		} else {
+			chinaIPRangesMu.RLock()
+			ipv4Count = len(chinaIPRanges)
+			chinaIPRangesMu.RUnlock()
+		}
+
+		if err := loadChinaIPV6List(); err != nil {
+			log.Printf("[警告] 加载中国IPv6列表失败: %v", err)
+		} else {
+			chinaIPV6RangesMu.RLock()
+			ipv6Count = len(chinaIPV6Ranges)
+			chinaIPV6RangesMu.RUnlock()
+		}
+
+		if ipv4Count > 0 || ipv6Count > 0 {
+			log.Printf("[启动] 已加载 %d 个中国IPv4段, %d 个中国IPv6段", ipv4Count, ipv6Count)
+		} else {
+			log.Printf("[警告] 未加载到任何中国IP列表，将使用默认规则")
+		}
+	} else if routingMode == "global" {
+		log.Printf("[启动] 分流模式: 全局代理")
+	} else if routingMode == "none" {
+		log.Printf("[启动] 分流模式: 不改变代理（直连模式）")
+	} else {
+		log.Printf("[警告] 未知的分流模式: %s，使用默认模式 global", routingMode)
+		routingMode = "global"
+	}
+
 	runProxyServer(listenAddr)
 }
 
 // ======================== 工具函数 ========================
+
+// ipToUint32 将IP地址转换为uint32
+func ipToUint32(ip net.IP) uint32 {
+	ip = ip.To4()
+	if ip == nil {
+		return 0
+	}
+	return uint32(ip[0])<<24 | uint32(ip[1])<<16 | uint32(ip[2])<<8 | uint32(ip[3])
+}
+
+// isChinaIP 检查IP是否在中国IP列表中（支持IPv4和IPv6）
+func isChinaIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+
+	// 检查IPv4
+	if ip.To4() != nil {
+		ipUint32 := ipToUint32(ip)
+		if ipUint32 == 0 {
+			return false
+		}
+
+		chinaIPRangesMu.RLock()
+		defer chinaIPRangesMu.RUnlock()
+
+		// 二分查找
+		left, right := 0, len(chinaIPRanges)
+		for left < right {
+			mid := (left + right) / 2
+			r := chinaIPRanges[mid]
+			if ipUint32 < r.start {
+				right = mid
+			} else if ipUint32 > r.end {
+				left = mid + 1
+			} else {
+				return true
+			}
+		}
+		return false
+	}
+
+	// 检查IPv6
+	ipBytes := ip.To16()
+	if ipBytes == nil {
+		return false
+	}
+
+	var ipArray [16]byte
+	copy(ipArray[:], ipBytes)
+
+	chinaIPV6RangesMu.RLock()
+	defer chinaIPV6RangesMu.RUnlock()
+
+	// 二分查找IPv6
+	left, right := 0, len(chinaIPV6Ranges)
+	for left < right {
+		mid := (left + right) / 2
+		r := chinaIPV6Ranges[mid]
+
+		// 比较起始IP
+		cmpStart := compareIPv6(ipArray, r.start)
+		if cmpStart < 0 {
+			right = mid
+			continue
+		}
+
+		// 比较结束IP
+		cmpEnd := compareIPv6(ipArray, r.end)
+		if cmpEnd > 0 {
+			left = mid + 1
+			continue
+		}
+
+		// 在范围内
+		return true
+	}
+	return false
+}
+
+// compareIPv6 比较两个IPv6地址，返回 -1, 0, 或 1
+func compareIPv6(a, b [16]byte) int {
+	for i := 0; i < 16; i++ {
+		if a[i] < b[i] {
+			return -1
+		} else if a[i] > b[i] {
+			return 1
+		}
+	}
+	return 0
+}
+
+// downloadIPList 下载IP列表文件
+func downloadIPList(url, filePath string) error {
+	log.Printf("[下载] 正在下载 IP 列表: %s", url)
+
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("下载失败: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("下载失败: HTTP %d", resp.StatusCode)
+	}
+
+	// 读取内容
+	content, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("读取下载内容失败: %w", err)
+	}
+
+	// 保存到文件
+	if err := os.WriteFile(filePath, content, 0644); err != nil {
+		return fmt.Errorf("保存文件失败: %w", err)
+	}
+
+	log.Printf("[下载] 已保存到: %s", filePath)
+	return nil
+}
+
+// loadChinaIPList 从程序目录加载中国IP列表
+func loadChinaIPList() error {
+	// 获取可执行文件所在目录
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取可执行文件路径失败: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	ipListFile := filepath.Join(exeDir, "chn_ip.txt")
+
+	// 如果文件不存在，尝试当前目录
+	if _, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		ipListFile = "chn_ip.txt"
+	}
+
+	// 检查文件是否存在或为空
+	needDownload := false
+	if info, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		needDownload = true
+		log.Printf("[加载] IPv4 列表文件不存在，将自动下载")
+	} else if info.Size() == 0 {
+		needDownload = true
+		log.Printf("[加载] IPv4 列表文件为空，将自动下载")
+	}
+
+	// 如果需要下载，先下载文件
+	if needDownload {
+		url := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt"
+		if err := downloadIPList(url, ipListFile); err != nil {
+			return fmt.Errorf("自动下载 IPv4 列表失败: %w", err)
+		}
+	}
+
+	file, err := os.Open(ipListFile)
+	if err != nil {
+		return fmt.Errorf("打开IP列表文件失败: %w", err)
+	}
+	defer file.Close()
+
+	var ranges []ipRange
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		startIP := net.ParseIP(parts[0])
+		endIP := net.ParseIP(parts[1])
+		if startIP == nil || endIP == nil {
+			continue
+		}
+
+		start := ipToUint32(startIP)
+		end := ipToUint32(endIP)
+		if start > 0 && end > 0 && start <= end {
+			ranges = append(ranges, ipRange{start: start, end: end})
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取IP列表文件失败: %w", err)
+	}
+
+	if len(ranges) == 0 {
+		return errors.New("IP列表为空")
+	}
+
+	// 按起始IP排序
+	for i := 0; i < len(ranges)-1; i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if ranges[i].start > ranges[j].start {
+				ranges[i], ranges[j] = ranges[j], ranges[i]
+			}
+		}
+	}
+
+	chinaIPRangesMu.Lock()
+	chinaIPRanges = ranges
+	chinaIPRangesMu.Unlock()
+
+	return nil
+}
+
+// loadChinaIPV6List 从程序目录加载中国IPv6 IP列表
+func loadChinaIPV6List() error {
+	// 获取可执行文件所在目录
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取可执行文件路径失败: %w", err)
+	}
+	exeDir := filepath.Dir(exePath)
+	ipListFile := filepath.Join(exeDir, "chn_ip_v6.txt")
+
+	// 如果文件不存在，尝试当前目录
+	if _, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		ipListFile = "chn_ip_v6.txt"
+	}
+
+	// 检查文件是否存在或为空
+	needDownload := false
+	if info, err := os.Stat(ipListFile); os.IsNotExist(err) {
+		needDownload = true
+		log.Printf("[加载] IPv6 列表文件不存在，将自动下载")
+	} else if info.Size() == 0 {
+		needDownload = true
+		log.Printf("[加载] IPv6 列表文件为空，将自动下载")
+	}
+
+	// 如果需要下载，先下载文件
+	if needDownload {
+		url := "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip_v6.txt"
+		if err := downloadIPList(url, ipListFile); err != nil {
+			log.Printf("[警告] 自动下载 IPv6 列表失败: %v，将跳过 IPv6 支持", err)
+			return nil // IPv6 列表下载失败不算致命错误
+		}
+	}
+
+	file, err := os.Open(ipListFile)
+	if err != nil {
+		// 文件打开失败，不算致命错误
+		log.Printf("[警告] 打开 IPv6 IP列表文件失败: %v，将跳过 IPv6 支持", err)
+		return nil
+	}
+	defer file.Close()
+
+	var ranges []ipRangeV6
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		startIP := net.ParseIP(parts[0])
+		endIP := net.ParseIP(parts[1])
+		if startIP == nil || endIP == nil {
+			continue
+		}
+
+		// 转换为16字节数组
+		startBytes := startIP.To16()
+		endBytes := endIP.To16()
+		if startBytes == nil || endBytes == nil {
+			continue
+		}
+
+		var start, end [16]byte
+		copy(start[:], startBytes)
+		copy(end[:], endBytes)
+
+		// 检查范围是否有效
+		if compareIPv6(start, end) <= 0 {
+			ranges = append(ranges, ipRangeV6{start: start, end: end})
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("读取IPv6 IP列表文件失败: %w", err)
+	}
+
+	if len(ranges) == 0 {
+		// IPv6列表为空不算错误，可能文件不存在或为空
+		return nil
+	}
+
+	// 按起始IP排序
+	for i := 0; i < len(ranges)-1; i++ {
+		for j := i + 1; j < len(ranges); j++ {
+			if compareIPv6(ranges[i].start, ranges[j].start) > 0 {
+				ranges[i], ranges[j] = ranges[j], ranges[i]
+			}
+		}
+	}
+
+	chinaIPV6RangesMu.Lock()
+	chinaIPV6Ranges = ranges
+	chinaIPV6RangesMu.Unlock()
+
+	return nil
+}
+
+// shouldBypassProxy 根据分流模式判断是否应该绕过代理（直连）
+func shouldBypassProxy(targetHost string) bool {
+	if routingMode == "none" {
+		// "不改变代理"模式：所有流量都直连
+		return true
+	}
+	if routingMode == "global" {
+		// "全局代理"模式：所有流量都走代理
+		return false
+	}
+	if routingMode == "bypass_cn" {
+		// "跳过中国大陆"模式：检查是否是中国IP
+		// 先尝试解析为IP
+		if ip := net.ParseIP(targetHost); ip != nil {
+			return isChinaIP(targetHost)
+		}
+		// 如果是域名，先解析IP
+		ips, err := net.LookupIP(targetHost)
+		if err != nil {
+			// 解析失败，默认走代理
+			return false
+		}
+		// 检查所有解析到的IP，如果有一个是中国IP，就直连
+		for _, ip := range ips {
+			if isChinaIP(ip.String()) {
+				return true
+			}
+		}
+		// 都不是中国IP，走代理
+		return false
+	}
+	// 未知模式，默认走代理
+	return false
+}
 
 func isNormalCloseError(err error) bool {
 	if err == nil {
@@ -902,6 +1314,20 @@ const (
 )
 
 func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	// 解析目标地址
+	targetHost, _, err := net.SplitHostPort(target)
+	if err != nil {
+		targetHost = target
+	}
+
+	// 检查是否应该绕过代理（直连）
+	if shouldBypassProxy(targetHost) {
+		log.Printf("[分流] %s -> %s (直连，绕过代理)", clientAddr, target)
+		return handleDirectConnection(conn, target, clientAddr, mode, firstFrame)
+	}
+
+	// 走代理
+	log.Printf("[分流] %s -> %s (通过代理)", clientAddr, target)
 	wsConn, err := dialWebSocketWithECH(2)
 	if err != nil {
 		sendErrorResponse(conn, mode)
@@ -1027,6 +1453,63 @@ func handleTunnel(conn net.Conn, target, clientAddr string, mode int, firstFrame
 
 	<-done
 	log.Printf("[代理] %s 已断开: %s", clientAddr, target)
+	return nil
+}
+
+// ======================== 直连处理 ========================
+
+// handleDirectConnection 处理直连（绕过代理）
+func handleDirectConnection(conn net.Conn, target, clientAddr string, mode int, firstFrame string) error {
+	// 解析目标地址
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		// 如果没有端口，根据模式添加默认端口
+		host = target
+		if mode == modeHTTPConnect || mode == modeHTTPProxy {
+			port = "443"
+		} else {
+			port = "80"
+		}
+		target = net.JoinHostPort(host, port)
+	}
+
+	// 直接连接到目标
+	targetConn, err := net.DialTimeout("tcp", target, 10*time.Second)
+	if err != nil {
+		sendErrorResponse(conn, mode)
+		return fmt.Errorf("直连失败: %w", err)
+	}
+	defer targetConn.Close()
+
+	// 发送成功响应
+	if err := sendSuccessResponse(conn, mode); err != nil {
+		return err
+	}
+
+	// 如果有预设的第一帧数据，先发送
+	if firstFrame != "" {
+		if _, err := targetConn.Write([]byte(firstFrame)); err != nil {
+			return err
+		}
+	}
+
+	// 双向转发
+	done := make(chan bool, 2)
+
+	// Client -> Target
+	go func() {
+		io.Copy(targetConn, conn)
+		done <- true
+	}()
+
+	// Target -> Client
+	go func() {
+		io.Copy(conn, targetConn)
+		done <- true
+	}()
+
+	<-done
+	log.Printf("[分流] %s 直连已断开: %s", clientAddr, target)
 	return nil
 }
 
