@@ -51,7 +51,6 @@ jobs:
             enable_gui: true
             cgo_enabled: "0"
 
-          # Linux 桌面版 amd64
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
@@ -63,7 +62,6 @@ jobs:
             enable_gui: true
             cgo_enabled: "0"
 
-          # Linux 桌面版 arm64
           - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
@@ -75,7 +73,6 @@ jobs:
             enable_gui: true
             cgo_enabled: "0"
 
-          # ✅ 软路由 x86_64（无 GUI，静态构建）
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
@@ -87,7 +84,6 @@ jobs:
             enable_gui: false
             cgo_enabled: "0"
 
-          # ✅ 软路由 arm64（RK3588 / 树莓派等）
           - os: ubuntu-latest
             goos: linux
             goarch: arm64
@@ -141,34 +137,101 @@ jobs:
           sudo apt-get install -y python3-pyqt5 python3-pyqt5.qtsvg python3-dev
         shell: bash
 
-      - name: Install PyInstaller and dependencies
+      - name: Install PyInstaller, PySocks, and other dependencies
         if: startsWith(github.ref, 'refs/tags/') && matrix.enable_gui == true
         run: |
           python -m pip install --upgrade pip
           if [ "${{ matrix.goos }}" == "linux" ]; then
             # Linux: 使用系统包中的 PyQt5，只安装其他依赖
-            pip install pyinstaller pystray Pillow
+            pip install pyinstaller pystray Pillow PySocks
             python -c "import PyQt5.QtWidgets; print('PyQt5 available')" || echo "PyQt5 not available, will skip GUI build"
           else
             # Windows / macOS: 从 PyPI 安装
-            pip install pyinstaller PyQt5 pystray Pillow
+            pip install pyinstaller PyQt5 pystray Pillow PySocks
+          fi
+        shell: bash
+
+      - name: Check application icon
+        if: startsWith(github.ref, 'refs/tags/') && matrix.enable_gui == true
+        run: |
+          # 检查图标文件是否存在（图标文件已包含在仓库中）
+          echo "Checking for icon files..."
+          ls -lh app_icon.* 2>/dev/null || echo "No icon files found"
+          if [ "${{ matrix.goos }}" == "windows" ]; then
+            if [ -f "app_icon.ico" ]; then
+              echo "✓ Found app_icon.ico"
+            elif [ -f "app_icon.png" ]; then
+              echo "✓ Found app_icon.png (will be used as icon)"
+            else
+              echo "⚠ No icon file found, PyInstaller will use default icon"
+            fi
+          elif [ "${{ matrix.goos }}" == "darwin" ]; then
+            if [ -f "app_icon.icns" ]; then
+              echo "✓ Found app_icon.icns"
+            elif [ -f "app_icon.png" ]; then
+              echo "✓ Found app_icon.png (will be used as icon)"
+            else
+              echo "⚠ No icon file found, PyInstaller will use default icon"
+            fi
+          else
+            if [ -f "app_icon.png" ]; then
+              echo "✓ Found app_icon.png"
+            else
+              echo "⚠ No icon file found, PyInstaller will use default icon"
+            fi
           fi
         shell: bash
 
       - name: Build Python executable
         if: startsWith(github.ref, 'refs/tags/') && matrix.enable_gui == true
         run: |
+          # 构建 PyInstaller 命令，根据平台添加图标
+          ICON_ARG=""
           if [ "${{ matrix.goos }}" == "windows" ]; then
-            pyinstaller --onefile --windowed --name ECHWorkersGUI gui.py
+            if [ -f "app_icon.ico" ]; then
+              ICON_ARG="--icon=app_icon.ico"
+            elif [ -f "app_icon.png" ]; then
+              ICON_ARG="--icon=app_icon.png"
+            fi
+            pyinstaller --onefile --windowed --name ECHWorkersGUI --hidden-import=PyQt5 $ICON_ARG gui.py
           elif [ "${{ matrix.goos }}" == "linux" ]; then
             if python -c "import PyQt5.QtWidgets" 2>/dev/null; then
-              pyinstaller --onefile --name ECHWorkersGUI gui.py
+              if [ -f "app_icon.png" ]; then
+                ICON_ARG="--icon=app_icon.png"
+              fi
+              pyinstaller --onefile --name ECHWorkersGUI --hidden-import=PyQt5 $ICON_ARG gui.py
             else
               echo "PyQt5 not available, skipping GUI build for Linux"
               echo "Only Go executable will be included"
             fi
           else
-            pyinstaller --onefile --name ECHWorkersGUI gui.py
+            # macOS
+            if [ -f "app_icon.icns" ]; then
+              ICON_ARG="--icon=app_icon.icns"
+            elif [ -f "app_icon.png" ]; then
+              ICON_ARG="--icon=app_icon.png"
+            fi
+            pyinstaller --onefile --name ECHWorkersGUI --hidden-import=PyQt5 $ICON_ARG gui.py
+          fi
+        shell: bash
+
+      - name: Download China IP list
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "Downloading latest China IP list (IPv4 and IPv6)..."
+          curl -L -o chn_ip.txt "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt" || echo "Failed to download IPv4 list, will skip"
+          curl -L -o chn_ip_v6.txt "https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip_v6.txt" || echo "Failed to download IPv6 list, will skip"
+          if [ -f "chn_ip.txt" ]; then
+            echo "✓ China IPv4 IP list downloaded successfully"
+            wc -l chn_ip.txt
+          else
+            echo "⚠ China IPv4 IP list download failed, release will continue without it"
+          fi
+          if [ -f "chn_ip_v6.txt" ]; then
+            echo "✓ China IPv6 IP list downloaded successfully"
+            wc -l chn_ip_v6.txt
+          else
+            echo "⚠ China IPv6 IP list download failed, release will continue without it"
           fi
         shell: bash
 
@@ -179,6 +242,16 @@ jobs:
           
           # Go 可执行文件
           cp ech-workers${{ matrix.exe_ext }} release/
+          
+          # 中国IP列表文件（离线版本）
+          if [ -f "chn_ip.txt" ]; then
+            cp chn_ip.txt release/
+            echo "✓ China IPv4 IP list included in release"
+          fi
+          if [ -f "chn_ip_v6.txt" ]; then
+            cp chn_ip_v6.txt release/
+            echo "✓ China IPv6 IP list included in release"
+          fi
           
           # GUI（仅桌面版）
           if [ "${{ matrix.enable_gui }}" = "true" ]; then
@@ -204,6 +277,12 @@ jobs:
             echo ""
             echo "Files:"
             echo "- ech-workers${{ matrix.exe_ext }}: Go compiled core proxy program"
+            if [ -f "release/chn_ip.txt" ]; then
+              echo "- chn_ip.txt: China IPv4 IP list (offline version)"
+            fi
+            if [ -f "release/chn_ip_v6.txt" ]; then
+              echo "- chn_ip_v6.txt: China IPv6 IP list (offline version)"
+            fi
             if [ "${{ matrix.enable_gui }}" = "true" ]; then
               if [ "${{ matrix.goos }}" == "windows" ]; then
                 echo "- ECHWorkersGUI.exe: Python GUI client (standalone executable)"
