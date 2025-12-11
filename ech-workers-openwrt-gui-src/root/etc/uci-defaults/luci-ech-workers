@@ -1,0 +1,58 @@
+#!/bin/sh
+# 首次安装时的初始化脚本
+
+DOWNLOAD_BASE="https://github.com/SunshineList/luci-app-ech-workers/releases/download/v1.0"
+BIN_PATH="/usr/bin/ech-workers"
+
+# 确保配置文件存在
+[ -f /etc/config/ech-workers ] || touch /etc/config/ech-workers
+
+# 设置 init 脚本权限
+chmod +x /etc/init.d/ech-workers 2>/dev/null
+
+# 清除 LuCI 缓存
+rm -rf /tmp/luci-modulecache /tmp/luci-indexcache 2>/dev/null
+
+# 如果二进制文件不存在，自动下载
+if [ ! -x "$BIN_PATH" ]; then
+    # 检测架构
+    ARCH=$(uname -m)
+    case "$ARCH" in
+        aarch64)
+            BIN_NAME="ech-workers-linux-arm64"
+            ;;
+        armv7l|armv7)
+            BIN_NAME="ech-workers-linux-armv7"
+            ;;
+        x86_64)
+            BIN_NAME="ech-workers-linux-amd64"
+            ;;
+        *)
+            logger -t "ech-workers" "不支持的架构: $ARCH"
+            exit 0
+            ;;
+    esac
+
+    DOWNLOAD_URL="${DOWNLOAD_BASE}/${BIN_NAME}"
+    logger -t "ech-workers" "正在下载 $BIN_NAME ..."
+
+    # 尝试使用 wget 或 curl 下载
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --no-check-certificate -O "$BIN_PATH" "$DOWNLOAD_URL"
+    elif command -v curl >/dev/null 2>&1; then
+        curl -sL -o "$BIN_PATH" "$DOWNLOAD_URL"
+    else
+        logger -t "ech-workers" "错误: 未找到 wget 或 curl"
+        exit 0
+    fi
+
+    if [ -f "$BIN_PATH" ] && [ -s "$BIN_PATH" ]; then
+        chmod +x "$BIN_PATH"
+        logger -t "ech-workers" "ech-workers 下载完成"
+    else
+        rm -f "$BIN_PATH"
+        logger -t "ech-workers" "错误: 下载失败"
+    fi
+fi
+
+exit 0

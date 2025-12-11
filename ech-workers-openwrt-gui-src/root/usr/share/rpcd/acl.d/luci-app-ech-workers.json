@@ -1,0 +1,37 @@
+{
+    "luci-app-ech-workers": {
+        "description": "Grant access to Tuple ECH Worker configuration",
+        "read": {
+            "uci": [
+                "ech-workers"
+            ],
+            "file": {
+                "/etc/init.d/ech-workers": [
+                    "read"
+                ],
+                "/usr/bin/ech-workers": [
+                    "read"
+                ]
+            },
+            "ubus": {
+                "service": [
+                    "list"
+                ],
+                "luci": [
+                    "getInitList",
+                    "getLocaltime"
+                ]
+            }
+        },
+        "write": {
+            "uci": [
+                "ech-workers"
+            ],
+            "ubus": {
+                "luci": [
+                    "setInitAction"
+                ]
+            }
+        }
+    }
+}

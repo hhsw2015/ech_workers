@@ -1,0 +1,101 @@
+msgid ""
+msgstr "Content-Type: text/plain; charset=UTF-8"
+
+msgid "Tuple ECH Worker"
+msgstr "Tuple ECH Worker 代理"
+
+msgid "基本设置"
+msgstr "基本设置"
+
+msgid "高级设置"
+msgstr "高级设置"
+
+msgid "分流设置"
+msgstr "分流设置"
+
+msgid "服务控制"
+msgstr "服务控制"
+
+msgid "启用"
+msgstr "启用"
+
+msgid "服务器地址"
+msgstr "服务器地址"
+
+msgid "监听地址"
+msgstr "监听地址"
+
+msgid "身份令牌"
+msgstr "身份令牌"
+
+msgid "优选 IP/域名"
+msgstr "优选 IP/域名"
+
+msgid "DoH 服务器"
+msgstr "DoH 服务器"
+
+msgid "ECH 域名"
+msgstr "ECH 域名"
+
+msgid "分流模式"
+msgstr "分流模式"
+
+msgid "全局代理 - 所有流量走代理"
+msgstr "全局代理 - 所有流量走代理"
+
+msgid "跳过中国大陆 - 国内IP直连"
+msgstr "跳过中国大陆 - 国内IP直连"
+
+msgid "不改变代理 - 所有流量直连"
+msgstr "不改变代理 - 所有流量直连"
+
+msgid "服务状态"
+msgstr "服务状态"
+
+msgid "运行中"
+msgstr "运行中"
+
+msgid "已停止"
+msgstr "已停止"
+
+msgid "检测中..."
+msgstr "检测中..."
+
+msgid "启动"
+msgstr "启动"
+
+msgid "停止"
+msgstr "停止"
+
+msgid "重启"
+msgstr "重启"
+
+msgid "查看日志"
+msgstr "查看日志"
+
+msgid "加载中..."
+msgstr "加载中..."
+
+msgid "无日志"
+msgstr "无日志"
+
+msgid "启动命令已发送"
+msgstr "启动命令已发送"
+
+msgid "停止命令已发送"
+msgstr "停止命令已发送"
+
+msgid "重启命令已发送"
+msgstr "重启命令已发送"
+
+msgid "透明代理"
+msgstr "透明代理"
+
+msgid "启用透明代理"
+msgstr "启用透明代理"
+
+msgid "重定向端口"
+msgstr "重定向端口"
+
+msgid "隐藏日志"
+msgstr "隐藏日志"

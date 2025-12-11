@@ -1,0 +1,66 @@
+<%# Tuple ECH Worker Status Template -%>
+
+    <script type="text/javascript">
+        //<![CDATA[
+        function updateStatus() {
+            XHR.get('<%=luci.dispatcher.build_url("admin", "services", "ech-workers", "status")%>', null,
+                function (x, data) {
+                    var running = data && data.running;
+                    var badge = document.getElementById('ech_status_badge');
+                    var text = document.getElementById('ech_status_text');
+
+                    if (running) {
+                        badge.className = 'badge success';
+                        text.innerHTML = '<%:运行中%>';
+                    } else {
+                        badge.className = 'badge warning';
+                        text.innerHTML = '<%:已停止%>';
+                    }
+                }
+            );
+        }
+
+        document.addEventListener('DOMContentLoaded', function () {
+            updateStatus();
+            setInterval(updateStatus, 5000);
+        });
+        //]]>
+    </script>
+
+    <style>
+        .ech-status-box {
+            margin-bottom: 1em;
+            padding: 1em;
+            background: #f7f7f7;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.3em 0.8em;
+            border-radius: 3px;
+            font-weight: bold;
+        }
+
+        .badge.success {
+            background: #5cb85c;
+            color: white;
+        }
+
+        .badge.warning {
+            background: #f0ad4e;
+            color: white;
+        }
+    </style>
+
+    <div class="ech-status-box">
+        <strong>
+            <%:服务状态%>:
+        </strong>
+        <span id="ech_status_badge" class="badge warning">
+            <span id="ech_status_text">
+                <%:检测中...%>
+            </span>
+        </span>
+    </div>

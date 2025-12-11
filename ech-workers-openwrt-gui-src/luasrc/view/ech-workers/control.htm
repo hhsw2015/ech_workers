@@ -1,0 +1,127 @@
+<%# Tuple ECH Worker Control Template -%>
+
+    <style>
+        .ech-control-box {
+            margin-top: 1em;
+            padding: 1em;
+            background: #f9f9f9;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+
+        .ech-control-box h4 {
+            margin-top: 0;
+            margin-bottom: 1em;
+        }
+
+        .ech-btn {
+            display: inline-block;
+            padding: 0.5em 1.5em;
+            margin-right: 0.5em;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            text-decoration: none;
+        }
+
+        .ech-btn-start {
+            background: #5cb85c;
+            color: white;
+        }
+
+        .ech-btn-stop {
+            background: #d9534f;
+            color: white;
+        }
+
+        .ech-btn-restart {
+            background: #5bc0de;
+            color: white;
+        }
+
+        .ech-btn-log {
+            background: #777;
+            color: white;
+        }
+
+        .ech-btn:hover {
+            opacity: 0.85;
+        }
+
+        .ech-log-box {
+            margin-top: 1em;
+            padding: 1em;
+            background: #1e1e1e;
+            color: #00ff41;
+            font-family: monospace;
+            font-size: 12px;
+            max-height: 400px;
+            overflow-y: auto;
+            border-radius: 4px;
+            display: none;
+        }
+    </style>
+
+    <div class="ech-control-box">
+        <h4>
+            <%:服务控制%>
+        </h4>
+
+        <button type="button" class="ech-btn ech-btn-start" onclick="echControl('start')">
+            <%:启动%>
+        </button>
+        <button type="button" class="ech-btn ech-btn-stop" onclick="echControl('stop')">
+            <%:停止%>
+        </button>
+        <button type="button" class="ech-btn ech-btn-restart" onclick="echControl('restart')">
+            <%:重启%>
+        </button>
+        <button type="button" class="ech-btn ech-btn-log" id="log_toggle_btn" onclick="toggleLog()">
+            <%:查看日志%>
+        </button>
+
+        <div id="ech_log_box" class="ech-log-box">
+            <pre id="ech_log_content"><%:加载中...%></pre>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        //<![CDATA[
+        function echControl(action) {
+            var url = '<%=luci.dispatcher.build_url("admin", "services", "ech-workers", "control")%>?action=' + action;
+
+            XHR.get(url, null, function (x) {
+                if (typeof updateStatus === 'function') {
+                    setTimeout(updateStatus, 1000);
+                }
+                var msg = action === 'start' ? '<%:启动命令已发送%>' :
+                    action === 'stop' ? '<%:停止命令已发送%>' :
+                        '<%:重启命令已发送%>';
+                alert(msg);
+                // 刷新页面以更新状态
+                setTimeout(function () { location.reload(); }, 1500);
+            });
+        }
+
+        function toggleLog() {
+            var logBox = document.getElementById('ech_log_box');
+            var logContent = document.getElementById('ech_log_content');
+            var toggleBtn = document.getElementById('log_toggle_btn');
+
+            if (logBox.style.display === 'none' || logBox.style.display === '') {
+                logBox.style.display = 'block';
+                toggleBtn.textContent = '<%:隐藏日志%>';
+                logContent.textContent = '<%:加载中...%>';
+                XHR.get('<%=luci.dispatcher.build_url("admin", "services", "ech-workers", "log")%>', null,
+                    function (x) {
+                        logContent.textContent = x.responseText || '<%:无日志%>';
+                    }
+                );
+            } else {
+                logBox.style.display = 'none';
+                toggleBtn.textContent = '<%:查看日志%>';
+            }
+        }
+        //]]>
+    </script>
