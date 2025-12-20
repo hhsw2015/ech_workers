@@ -68,7 +68,7 @@ read -p "请选择【1-5】:" menu
 if [ "$menu" = "1" ]; then
 mkdir -p "$HOME/cfs5http"
 if [ ! -s "$HOME/cfs5http/cfwp" ]; then
-curl -L -o "$HOME/cfs5http/cfwp" -# --retry 2 --insecure https://raw.githubusercontent.com/yonggekkk/Cloudflare-vless-trojan/main/s5http_wkpgs/linux-$cpu
+curl -L -o "$HOME/cfs5http/cfwp" -# --retry 2 --insecure https://raw.githubusercontent.com/hhsw2015/ech_workers/main/cloudflare_socks5_http/linux-$cpu
 chmod +x "$HOME/cfs5http/cfwp"
 fi
 echo
